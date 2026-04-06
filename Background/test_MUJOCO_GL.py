@@ -1,18 +1,28 @@
 """
 测试 MUJOCO_GL 渲染后端是否可用。
-支持三种模式：egl（无头GPU）、osmesa（CPU软渲染）、glfw（有窗口）
+支持三种模式：
+  egl    - Linux 无头GPU渲染（服务器常用）
+  osmesa - CPU 软渲染（无GPU时）
+  glfw   - 有窗口渲染（macOS/桌面）
 用法：
-    python test_mujoco_gl.py            # 默认用 egl
-    python test_mujoco_gl.py osmesa     # 用 osmesa
-    python test_mujoco_gl.py glfw       # 用 glfw（需要显示器）
+    python test_mujoco_gl.py            # 自动选择默认后端
+    python test_mujoco_gl.py osmesa     # 强制用 osmesa
+    python test_mujoco_gl.py glfw       # 强制用 glfw
 """
 
 import sys
 import os
+import platform
 
 # ---------- 1. 设置渲染后端 ----------
-GL_BACKEND = sys.argv[1] if len(sys.argv) > 1 else "egl"
+# macOS 不支持 egl，默认用 glfw；Linux 默认用 egl
+if len(sys.argv) > 1:
+    GL_BACKEND = sys.argv[1]
+else:
+    GL_BACKEND = "glfw" if platform.system() == "Darwin" else "egl"
+
 os.environ["MUJOCO_GL"] = GL_BACKEND
+print(f"[INFO] 操作系统   = {platform.system()}")
 print(f"[INFO] MUJOCO_GL = {GL_BACKEND}")
 
 # ---------- 2. 导入 MuJoCo ----------
