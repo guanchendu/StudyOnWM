@@ -3,3 +3,5 @@ __pycache__/
 data/
 *.h5
 *.tar.gz
+
+*.pt

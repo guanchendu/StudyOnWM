@@ -215,13 +215,15 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="A small example of using a pretrained model for a downstream task."
     )
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=2560)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--feature-dim", type=int, default=128)
-    parser.add_argument("--pretrain-epochs", type=int, default=3)
-    parser.add_argument("--downstream-epochs", type=int, default=5)
+    parser.add_argument("--pretrain-epochs", type=int, default=10)
+    parser.add_argument("--downstream-epochs", type=int, default=15)
     parser.add_argument("--pretrain-lr", type=float, default=1e-3)
     parser.add_argument("--downstream-lr", type=float, default=1e-3)
+    parser.add_argument("---retrain", type=bool, default=True)
+
     parser.add_argument(
         "--pretrained-path",
         type=str,
@@ -240,7 +242,7 @@ def main():
 
     autoencoder = SmallAutoEncoder(feature_dim=args.feature_dim).to(device)
 
-    if save_path.exists():
+    if save_path.exists() and args.retrain == False:
         autoencoder.encoder.load_state_dict(torch.load(save_path, map_location=device))
         print(f"Loaded pretrained encoder from {save_path}")
     else:
