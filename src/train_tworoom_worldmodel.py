@@ -155,7 +155,7 @@ def run_epoch(
     total_epochs: int,
     batch_index: int | None = None,
 ):
-    is_train = True
+    is_train = optimizer is not None
     model.train(is_train)
 
     total_loss = 0.0
@@ -170,7 +170,7 @@ def run_epoch(
 
         batch = flatten_sequence_batch(raw_batch)
         batch = {k: v.to(device) for k, v in batch.items()}
-        is_train = True
+
         with torch.set_grad_enabled(is_train):
             pred_pixels, pred_proprio = model(
                 batch["pixels_t"],
@@ -307,7 +307,7 @@ def main():
             proprio_loss_weight=args.proprio_loss_weight,
             epoch_idx=epoch,
             total_epochs=args.epochs,
-            batch_index=epoch - 1,
+            batch_index=None,
         )
         val_metrics = run_epoch(
             model=model,
@@ -318,7 +318,7 @@ def main():
             proprio_loss_weight=args.proprio_loss_weight,
             epoch_idx=epoch,
             total_epochs=args.epochs,
-            batch_index=epoch - 1,
+            batch_index=None,
         )
 
         print(

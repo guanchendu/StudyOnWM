@@ -234,7 +234,7 @@ def main():
 
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
     device = pick_device(args.device)
-    checkpoint_meta = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint_meta = torch.load(checkpoint_path, map_location="mps")
     checkpoint_cfg = checkpoint_meta["config"]
 
     if args.img_size is None:
