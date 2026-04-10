@@ -1,0 +1,17 @@
+{
+  "checkpoint": "/Users/guanchendu/Code/StudyOnWM/src/outputs/tworoom_worldmodel/best_simple_world_model.pt",
+  "device": "mps",
+  "dataset_size": 730809,
+  "val_size": 73080,
+  "evaluation_time_sec": 164.55117392539978,
+  "one_step_loss": 0.7082455521472896,
+  "one_step_pixel_loss": 0.6299556353344054,
+  "one_step_proprio_loss": 0.7828991605860977,
+  "rollout_horizon": 3,
+  "rollout_sequences": 128,
+  "rollout_steps_per_sequence": 3,
+  "rollout_pixel_l1": 1.0294609069824219,
+  "rollout_pixel_mse": 1.7215089003245037,
+  "rollout_proprio_l1": 0.7417165637016296,
+  "rollout_proprio_mse": 0.8271832466125488
+}

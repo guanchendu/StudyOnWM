@@ -10,7 +10,6 @@ import stable_worldmodel as swm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tqdm.auto import tqdm
 
 from Background.utils import get_column_normalizer, get_img_preprocessor
 
@@ -156,7 +155,7 @@ def run_epoch(
     total_epochs: int,
     batch_index: int | None = None,
 ):
-    is_train = optimizer is not None
+    is_train = True
     model.train(is_train)
 
     total_loss = 0.0
@@ -164,21 +163,14 @@ def run_epoch(
     total_proprio_loss = 0.0
     total_items = 0
 
-    stage = "train" if is_train else "val"
-    progress = tqdm(
-        loader,
-        desc=f"Epoch {epoch_idx:03d}/{total_epochs:03d} [{stage}]",
-        leave=False,
-    )
-
-    for idx, raw_batch in enumerate(progress):
+    for idx, raw_batch in enumerate(loader):
         # Skip to target batch if batch_index is specified
         if batch_index is not None and idx != batch_index:
             continue
 
         batch = flatten_sequence_batch(raw_batch)
         batch = {k: v.to(device) for k, v in batch.items()}
-
+        is_train = True
         with torch.set_grad_enabled(is_train):
             pred_pixels, pred_proprio = model(
                 batch["pixels_t"],
@@ -200,12 +192,6 @@ def run_epoch(
         total_loss += loss.item() * bs
         total_pixel_loss += pixel_loss.item() * bs
         total_proprio_loss += proprio_loss.item() * bs
-
-        progress.set_postfix(
-            loss=f"{loss.item():.4f}",
-            pixel=f"{pixel_loss.item():.4f}",
-            proprio=f"{proprio_loss.item():.4f}",
-        )
 
         # Break after processing target batch if batch_index is specified
         if batch_index is not None:
@@ -229,8 +215,8 @@ def parse_args():
     parser.add_argument("--img-size", type=int, default=64)
     parser.add_argument("--num-steps", type=int, default=4)
     parser.add_argument("--frameskip", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=2048)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--latent-dim", type=int, default=256)
     parser.add_argument("--train-split", type=float, default=0.9)
