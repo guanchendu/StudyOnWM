@@ -154,6 +154,7 @@ def run_epoch(
     proprio_loss_weight: float,
     epoch_idx: int,
     total_epochs: int,
+    batch_index: int | None = None,
 ):
     is_train = optimizer is not None
     model.train(is_train)
@@ -170,7 +171,11 @@ def run_epoch(
         leave=False,
     )
 
-    for raw_batch in progress:
+    for idx, raw_batch in enumerate(progress):
+        # Skip to target batch if batch_index is specified
+        if batch_index is not None and idx != batch_index:
+            continue
+
         batch = flatten_sequence_batch(raw_batch)
         batch = {k: v.to(device) for k, v in batch.items()}
 
@@ -201,6 +206,10 @@ def run_epoch(
             pixel=f"{pixel_loss.item():.4f}",
             proprio=f"{proprio_loss.item():.4f}",
         )
+
+        # Break after processing target batch if batch_index is specified
+        if batch_index is not None:
+            break
 
     return {
         "loss": total_loss / total_items,
@@ -312,6 +321,7 @@ def main():
             proprio_loss_weight=args.proprio_loss_weight,
             epoch_idx=epoch,
             total_epochs=args.epochs,
+            batch_index=epoch - 1,
         )
         val_metrics = run_epoch(
             model=model,
@@ -322,6 +332,7 @@ def main():
             proprio_loss_weight=args.proprio_loss_weight,
             epoch_idx=epoch,
             total_epochs=args.epochs,
+            batch_index=epoch - 1,
         )
 
         print(
