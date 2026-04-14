@@ -81,7 +81,7 @@ def parse_args():
     )
     parser.add_argument(
         "--text",
-        default="I am excited to try Hugging Face models today.",
+        default="i am donald trump",
         help="Input text for sentiment analysis.",
     )
     parser.add_argument(
