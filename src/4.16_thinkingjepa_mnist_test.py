@@ -140,12 +140,16 @@ class HierarchicalPyramidRepresentationExtractor:
                 "layer_groups"  : List[List[int]],            每 level 对应的层索引 (0-based)
             }
         """
-        # 跳过 index-0 的 embedding 层，只取 transformer block 输出
+        # 跳过 index-0 的 embedding 层，只取 transformer block 输出  拿到各层输出 因为 index 0 是Embedding 的
         layer_outputs = hidden_states[1:]   # (L, batch=1, seq_len, hidden_dim)
         L = len(layer_outputs)
         K = self.num_pyramid_levels
 
         # ── 每层表征: 在 token 维度做 mean pool ────────────────────────────
+        '''
+        Step 2：每层做 token mean pooling
+        把一句话的所有 token 向量取平均，得到这一层对整个输入的"综合理解"：
+        '''
         per_layer_reps: list[torch.Tensor] = []
         for h in layer_outputs:
             # h: [1, seq_len, hidden_dim]  → mean over tokens → [hidden_dim]
@@ -153,6 +157,13 @@ class HierarchicalPyramidRepresentationExtractor:
             per_layer_reps.append(rep)
 
         # ── 分组: 将 L 层均分为 K 个 pyramid level ──────────────────────────
+        '''
+        把 L 层均匀分成 K 组，例如 L=36, K=4：
+        Level 1: layers  0~8   (浅层，词法特征)
+        Level 2: layers  9~17  (语义特征)
+        Level 3: layers 18~26  (推理特征)
+        Level 4: layers 27~35  (高层抽象)
+        '''
         layer_groups: list[list[int]] = []
         for k in range(K):
             start = int(k * L / K)
@@ -166,6 +177,14 @@ class HierarchicalPyramidRepresentationExtractor:
             group_hidden = torch.stack(
                 [layer_outputs[i][0].float() for i in group_indices], dim=0
             )
+            '''
+            每组做两次 pooling
+            [n_group, seq_len, hidden_dim]
+                ↓ mean(dim=0)  ← 把同组的层平均（层间融合）
+            [seq_len, hidden_dim]
+                ↓ mean(dim=0)  ← 把所有 token 平均（序列压缩）
+            [hidden_dim]       ← 最终这个 level 的表征向量
+            '''
             # layer-wise mean → [seq_len, hidden_dim]
             level_rep = group_hidden.mean(dim=0)
             # token-wise mean → [hidden_dim]
