@@ -56,7 +56,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 IMG_SIZE            = 64
 NUM_STEPS           = 4          # 每条序列帧数
 FRAMESKIP           = 5
-BATCH_SIZE          = 64          # Qwen 4B 很大,batch 设小一点
+BATCH_SIZE          = 512          # Qwen 4B 很大,batch 设小一点
 EPOCHS              = 10
 LR                  = 1e-4
 PATCH_SIZE          = 8
@@ -454,50 +454,53 @@ def main():
     n_params = sum(p.numel() for p in trainable)
     print(f"[jepa] trainable params: {n_params:,}")
     print("=" * 72)
-    print("ThinkJEPA training  (1 batch per epoch)")
+    print("ThinkJEPA training  (full tworoom dataset per epoch)")
     print("=" * 72)
 
     # 4. 训练 ---------------------------------------------------------------
     for epoch in range(1, EPOCHS + 1):
         model.train()
-        # 每 epoch 只跑一个 batch: total=1
-        pbar = tqdm(total=1, desc=f"Epoch {epoch:03d}/{EPOCHS}", leave=True)
+        pbar = tqdm(loader, total=len(loader), desc=f"Epoch {epoch:03d}/{EPOCHS}", leave=True)
 
-        raw_batch = next(iter(loader))          # 一个 batch 就行
-        batch = make_transition_pair(raw_batch)
-        batch = {k: v.to(device) for k, v in batch.items()}
+        epoch_loss, n_batches = 0.0, 0
+        for raw_batch in pbar:
+            batch = make_transition_pair(raw_batch)
+            batch = {k: v.to(device) for k, v in batch.items()}
 
-        # 4a. 构造长视频文本并过 Qwen → HPRE 金字塔 guidance
-        chat_texts = build_video_prompts(raw_batch, thinker.tokenizer, NUM_STEPS)
-        pyramid = thinker(chat_texts)           # list of K tensors [B, D_qwen]
+            # 4a. 构造长视频文本并过 Qwen → HPRE 金字塔 guidance
+            chat_texts = build_video_prompts(raw_batch, thinker.tokenizer, NUM_STEPS)
+            pyramid = thinker(chat_texts)           # list of K tensors [B, D_qwen]
 
-        # 4b. JEPA 前向
-        z_pred, z_tgt = model(
-            batch["pixels_t"],
-            batch["pixels_tp1"],
-            batch["action_t"],
-            batch["proprio_t"],
-            pyramid,
-        )
+            # 4b. JEPA 前向
+            z_pred, z_tgt = model(
+                batch["pixels_t"],
+                batch["pixels_tp1"],
+                batch["action_t"],
+                batch["proprio_t"],
+                pyramid,
+            )
 
-        # 4c. 预测 loss (token-level smooth L1,JEPA 标准做法之一)
-        loss = F.smooth_l1_loss(z_pred.contiguous(), z_tgt.contiguous())
+            # 4c. 预测 loss (token-level smooth L1,JEPA 标准做法之一)
+            loss = F.smooth_l1_loss(z_pred.contiguous(), z_tgt.contiguous())
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
-        optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+            optimizer.step()
 
-        # 4d. EMA target encoder 更新
-        model.ema_update(EMA_MOMENTUM)
+            # 4d. EMA target encoder 更新
+            model.ema_update(EMA_MOMENTUM)
 
-        pbar.set_postfix(
-            loss=f"{loss.item():.4f}",
-            pred_norm=f"{z_pred.norm().item():.2f}",
-            tgt_norm=f"{z_tgt.norm().item():.2f}",
-        )
-        pbar.update(1)
+            epoch_loss += loss.item()
+            n_batches  += 1
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                avg=f"{epoch_loss/n_batches:.4f}",
+                pred_n=f"{z_pred.norm().item():.2f}",
+                tgt_n=f"{z_tgt.norm().item():.2f}",
+            )
         pbar.close()
+        print(f"[Epoch {epoch:03d}] avg_loss={epoch_loss/max(n_batches,1):.4f}")
 
     # 5. 保存 ---------------------------------------------------------------
     save_path = OUTPUT_DIR / "thinkjepa_tworoom.pt"
