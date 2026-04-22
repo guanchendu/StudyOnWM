@@ -13,3 +13,10 @@ models/
 
 
 .claude/worktrees/
+
+outputs/
+models/
+data/
+*.safetensors
+*.h5
+*.tar.gz
