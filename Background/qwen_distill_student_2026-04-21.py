@@ -628,3 +628,15 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+'''
+
+python /Users/guanchendu/Background/qwen_distill_student_2026-04-21.py \
+  --teacher-dir /Users/guanchendu/Code/StudyOnWM/models/Qwen3-4B-Instruct-2507 \
+  --train-file /Users/guanchendu/Code/StudyOnWM/data/distill_corpus.jsonl \
+  --output-dir /Users/guanchendu/Code/StudyOnWM/outputs/qwen3-student-8l \
+  --student-layers 8 \
+  --max-steps 200
+
+'''
