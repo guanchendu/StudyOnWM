@@ -20,3 +20,5 @@ data/
 *.safetensors
 *.h5
 *.tar.gz
+
+.DS_Store
