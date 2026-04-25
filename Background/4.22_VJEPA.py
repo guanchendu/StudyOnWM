@@ -443,7 +443,8 @@ def demo():
     print(f"[模型] Predictor:        {n_pred/1e6:.2f}M 参数 (需梯度)")
 
     # -------- 遮罩配置 (两种) --------
-    grid_t = 16 // 2   # 8
+    grid_t = 16 // 2   # 8  tubelet_size=2 的意思:把每 2 帧连续的帧一起卷成 1 个 token,16 帧全部都用到,只是两两合并后得到 8 个时间 token。
+
     grid_h = 224 // 16  # 14
     grid_w = 224 // 16  # 14
     num_patches = grid_t * grid_h * grid_w  # 1568
