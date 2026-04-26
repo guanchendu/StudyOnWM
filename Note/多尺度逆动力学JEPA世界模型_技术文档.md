@@ -2,7 +2,7 @@
 
 ## 1. 核心思想
 
-在不同时间尺度上做逆动力学，让模型**自动发现动作的层次化抽象**：
+#### 在不同时间尺度上做逆动力学，让模型**自动发现动作的层次化抽象**：
 
 - **粗粒度逆动力学**：(z_t, z_{t+h}) → â^{coarse} — 用一个向量回答"这 h 步整体做了什么"
 - **细粒度逆动力学**：(z_t, z_{t+1}) → â^{fine} — 用一个向量回答"这一步具体做了什么"
@@ -297,73 +297,123 @@ v2: 分两级搜索
     总搜索量更小，且粗粒度先确定方向，细粒度在局部优化
 ```
 
-### 6.2 完整流程
+### 6.2 逆动力学 Warm-Start（核心改进）
+
+之前的问题：逆动力学只在阶段一训练时使用，规划时闲置。CEM 从零开始盲目搜索。
+
+改进：**用逆动力学为 CEM 提供初始化**，让搜索从一个合理的起点开始。
+
+```
+逆动力学的能力：给定 (z_current, z_target)，直接输出"应该做什么动作"
+
+规划时直接利用：
+  â^c_init = coarse_inv_dyn(z_0, z_goal)   ← "整体应该往哪个方向"
+  â^f_init = fine_inv_dyn(z_t, z_target)    ← "下一步具体怎么走"
+
+不替代 CEM，而是给 CEM 一个 warm start:
+  μ = invdyn_estimate     ← 不是零向量，而是逆动力学的估计
+  σ = 0.5                 ← 方差更小，在估计附近搜索即可
+```
+
+### 6.3 完整流程（带 Warm-Start）
 
 ```
 已知: o_0（当前观测），z_goal（目标 latent）
 设 H = 总 horizon, h = 粗粒度步长, K = H/h 段
 
-═══ 第一级：粗粒度规划 ═══
+═══ 第一级：粗粒度规划（逆动力学初始化 + CEM 精调）═══
 
   z_0 = encoder(o_0)
 
-  for cem_iter in range(M1):
-    # 采样 N 条粗粒度动作序列
-    # 每条 = [â^c_0, â^c_1, ..., â^c_{K-1}]，共 K 个 coarse action
-    candidates_coarse: (N, K, coarse_action_dim)
-
-    # 对每条候选，用 coarse predictor rollout
-    for i in range(N):
-      z = z_0
-      for k in range(K):
-        z = coarse_predictor(z, candidates_coarse[i, k])
-      cost_i = ||z - z_goal||²
-
-    # CEM 更新：选 top-k，更新 μ_coarse, σ_coarse
-
-  # 得到最优粗粒度路径
-  best_coarse_actions = [â^c*_0, â^c*_1, ..., â^c*_{K-1}]
-  
-  # 用 coarse predictor 算出 waypoints
-  waypoints = [z_0]
+  # ---- Warm-Start: 逆动力学给出初始路径 ----
   z = z_0
+  coarse_inits = []
   for k in range(K):
-    z = coarse_predictor(z, best_coarse_actions[k])
-    waypoints.append(z)
-  # waypoints = [z_0, ẑ_h, ẑ_{2h}, ..., ẑ_H]
+    â^c = coarse_inv_dyn(z, z_goal)       ← 逆动力学估计
+    coarse_inits.append(â^c)
+    z = coarse_predictor(z, â^c)          ← 用估计往前推，为下一段提供起点
 
-═══ 第二级：细粒度规划（在每对相邻 waypoints 之间）═══
+  # ---- CEM 以逆动力学估计为初始化 ----
+  μ_coarse = stack(coarse_inits)          ← 不是零向量！
+  σ_coarse = 0.5                          ← 比随机初始化 σ=1 小
 
-  all_fine_actions = []
+  for cem_iter in range(M1):
+    candidates = sample(μ_coarse, σ_coarse)   ← 在逆动力学估计附近采样
+    
+    for each candidate:
+      rollout with coarse_predictor → cost = ||ẑ_H - z_goal||²
+
+    top-k → update μ_coarse, σ_coarse
+
+  waypoints = rollout(z_0, best_coarse_actions)
+
+═══ 第二级：细粒度规划（同样带 Warm-Start）═══
 
   for k in range(K):
     z_start = waypoints[k]
-    z_target = waypoints[k+1]    ← 粗粒度 waypoint 作为 condition
+    z_target = waypoints[k+1]
+
+    # ---- Warm-Start: 细粒度逆动力学逐步估计 ----
+    z = z_start
+    fine_inits = []
+    for t in range(h):
+      â^f = fine_inv_dyn(z, z_target)     ← 逆动力学估计
+      fine_inits.append(â^f)
+      z = fine_predictor(z, â^f, cond=z_target)
+
+    # ---- CEM 精调 ----
+    μ_fine = stack(fine_inits)
+    σ_fine = 0.5
 
     for cem_iter in range(M2):
-      # 采样 N 条细粒度动作序列
-      # 每条 = [â^f_0, ..., â^f_{h-1}]，只有 h 步
-      candidates_fine: (N, h, fine_action_dim)
+      candidates = sample(μ_fine, σ_fine)
+      rollout with fine_predictor → cost = ||ẑ - z_target||²
+      top-k → update μ_fine, σ_fine
 
-      # 对每条候选，用 fine predictor rollout
-      for i in range(N):
-        z = z_start
-        for t in range(h):
-          z = fine_predictor(z, candidates_fine[i, t], cond=z_target)
-        cost_i = ||z - z_target||²
-
-      # CEM 更新
-
-    # 得到这一段的最优细粒度动作
-    all_fine_actions.extend(best_fine_actions_for_segment_k)
+    all_fine_actions.extend(best_fine_for_segment_k)
 
 ═══ 执行 ═══
 
-  # 解码第一个细粒度动作
   a_0_real = fine_action_decoder(all_fine_actions[0])
-  
-  # 执行，拿到 o_1，回到第一级（receding horizon）
+  执行 → 新观测 o_1 → 回到第一级 (receding horizon)
 ```
+
+### 6.4 逆动力学在训练 vs 规划中的角色
+
+```
+训练时 (阶段一):
+  逆动力学: (z_t, z_{t+1}) → â^fine
+            (z_t, z_{t+h}) → â^coarse
+  作用: 为 predictor 生成 latent action 输入
+        同时塑造了有意义的 latent action space
+
+规划时:
+  逆动力学: (z_current, z_goal) → â^init
+  作用: 给 CEM 提供 warm-start 初始化
+        利用"给定起点和终点，推断动作"的能力
+        CEM 不再从零搜索，而是在合理估计附近精调
+
+两个阶段都有贡献，逆动力学不再是只训练时用的辅助模块。
+```
+
+### 6.5 消融实验设计
+
+```
+这个改进本身就是一个重要的消融实验：
+
+  A. CEM 随机初始化 (μ=0, σ=1)        ← baseline
+  B. CEM 逆动力学初始化 (μ=invdyn, σ=0.5)  ← 我们
+
+  对比指标:
+  - CEM 收敛速度 (cost vs iteration 曲线)
+  - 最终规划 success rate
+  - 相同 CEM 步数下的性能差异
+
+  预期: B 在更少 CEM 步数下就能达到 A 的最终性能
+        → 逆动力学对规划有直接贡献，不只是训练辅助
+```
+
+### 6.6 规划效率对比
 
 ### 6.3 规划效率对比
 

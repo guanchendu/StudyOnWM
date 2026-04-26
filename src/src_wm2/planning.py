@@ -1,12 +1,16 @@
 """
-Two-level CEM planning for Multi-Scale InvDyn World Model.
+Two-level CEM planning with inverse dynamics warm-start.
 
-Level 1 (Coarse): CEM searches in coarse action space → waypoints
-Level 2 (Fine):   CEM searches in fine action space between waypoints
+Key insight: inverse dynamics models are not just for training —
+they directly provide initial action estimates for CEM at both scales.
 
-This is more efficient than single-level CEM because:
-  - Coarse level narrows down the search to a good overall direction
-  - Fine level only optimizes locally (h steps) with a clear target (waypoint)
+Level 1 (Coarse):
+  1. Coarse inverse dynamics gives initial estimate: â^c = inv_coarse(z_t, z_goal)
+  2. CEM refines around this estimate → waypoints
+
+Level 2 (Fine):
+  1. Fine inverse dynamics gives initial estimates: â^f = inv_fine(z_t, z_target)
+  2. CEM refines around these estimates → fine actions
 """
 
 import sys
@@ -31,7 +35,7 @@ from src_wm2.models import (
 )
 
 
-def _load_phase1(ckpt_path: str | Path, device: torch.device) -> MultiScaleInvDynWorldModel:
+def _load_phase1(ckpt_path: str | Path, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location="cpu")
     cfg = ckpt["config"]
     model = MultiScaleInvDynWorldModel(
@@ -51,10 +55,12 @@ def _load_phase1(ckpt_path: str | Path, device: torch.device) -> MultiScaleInvDy
 
 
 class TwoLevelPlanner(nn.Module):
-    """Two-level CEM planner using the full Phase 1 + Phase 2 model.
+    """Two-level CEM planner with inverse dynamics warm-start.
 
-    Level 1: Search in coarse latent action space for waypoints.
-    Level 2: Search in fine latent action space between waypoints.
+    Instead of CEM starting from random (μ=0, σ=1), inverse dynamics
+    provides an informed initial estimate. CEM then refines locally.
+
+    This makes inverse dynamics useful at BOTH training and planning time.
     """
 
     def __init__(
@@ -65,13 +71,13 @@ class TwoLevelPlanner(nn.Module):
     ):
         super().__init__()
 
-        # ---- Phase 1 ----
+        # ---- Phase 1: world model + inverse dynamics ----
         self.world_model, p1_cfg = _load_phase1(phase1_ckpt, device)
         self.horizon_h = p1_cfg["horizon_h"]
         self.fine_action_dim = p1_cfg["fine_action_dim"]
         self.coarse_action_dim = p1_cfg["coarse_action_dim"]
 
-        # ---- Phase 2 ----
+        # ---- Phase 2: action encoders/decoders ----
         p2_ckpt = torch.load(phase2_ckpt, map_location="cpu")
         p2_cfg = p2_ckpt["config"]
         self.action_dim = p2_ckpt["action_dim"]
@@ -105,6 +111,77 @@ class TwoLevelPlanner(nn.Module):
     def device(self) -> torch.device:
         return next(self.world_model.encoder.parameters()).device
 
+    # ================================================================
+    # Inverse dynamics warm-start
+    # ================================================================
+
+    @torch.inference_mode()
+    def _coarse_invdyn_init(
+        self,
+        z_start_pooled: torch.Tensor,
+        z_goal: torch.Tensor,
+        num_segments: int,
+    ) -> torch.Tensor:
+        """Use coarse inverse dynamics to generate initial coarse action sequence.
+
+        Iteratively: predict â^c, step forward with coarse predictor, repeat.
+
+        Args:
+            z_start_pooled: (1, D)
+            z_goal:         (1, D)
+            num_segments:   K
+
+        Returns:
+            coarse_actions_init: (K, coarse_action_dim)
+        """
+        num_tokens = self.world_model.encoder.num_tokens
+        inits = []
+        z = z_start_pooled  # (1, D)
+
+        for _ in range(num_segments):
+            a_c = self.world_model.coarse_inv_dyn(z, z_goal)  # (1, coarse_action_dim)
+            inits.append(a_c.squeeze(0))
+            z_tokens = z.unsqueeze(1).expand(-1, num_tokens, -1)
+            z = self.world_model.coarse_predictor(z_tokens, a_c)
+
+        return torch.stack(inits, dim=0)  # (K, coarse_action_dim)
+
+    @torch.inference_mode()
+    def _fine_invdyn_init(
+        self,
+        z_start_pooled: torch.Tensor,
+        z_target: torch.Tensor,
+        num_steps: int,
+    ) -> torch.Tensor:
+        """Use fine inverse dynamics to generate initial fine action sequence.
+
+        At each step, fine inv dyn estimates the action toward z_target,
+        then fine predictor steps forward.
+
+        Args:
+            z_start_pooled: (1, D)
+            z_target:       (1, D)
+            num_steps:      h
+
+        Returns:
+            fine_actions_init: (h, fine_action_dim)
+        """
+        num_tokens = self.world_model.encoder.num_tokens
+        inits = []
+        z = z_start_pooled  # (1, D)
+
+        for _ in range(num_steps):
+            a_f = self.world_model.fine_inv_dyn(z, z_target)  # (1, fine_action_dim)
+            inits.append(a_f.squeeze(0))
+            z_tokens = z.unsqueeze(1).expand(-1, num_tokens, -1)
+            z = self.world_model.fine_predictor(z_tokens, a_f, z_target)
+
+        return torch.stack(inits, dim=0)  # (h, fine_action_dim)
+
+    # ================================================================
+    # Two-level planning
+    # ================================================================
+
     @torch.inference_mode()
     def plan(
         self,
@@ -117,17 +194,22 @@ class TwoLevelPlanner(nn.Module):
         fine_cem_samples: int = 256,
         fine_cem_steps: int = 20,
         fine_topk: int = 32,
+        invdyn_init: bool = True,
+        init_sigma: float = 0.5,
     ) -> list[torch.Tensor]:
         """
-        Two-level planning.
+        Two-level CEM planning with optional inverse dynamics warm-start.
 
         Args:
-            current_pixels: (1, 3, H, W)
-            goal_pixels:    (1, 3, H, W)
-            num_coarse_segments: how many coarse steps (total horizon = K * h)
+            current_pixels:      (1, 3, H, W)
+            goal_pixels:         (1, 3, H, W)
+            num_coarse_segments: K segments of h steps each
+            invdyn_init:         if True, use inverse dynamics for CEM initialization
+                                 if False, fall back to random init (for ablation)
+            init_sigma:          initial σ when using invdyn init (smaller = trust init more)
 
         Returns:
-            list of real actions [a_0, a_1, ..., a_{K*h-1}], each (action_dim,)
+            list of real actions [a_0, a_1, ..., a_{K*h-1}]
         """
         K = num_coarse_segments
         h = self.horizon_h
@@ -135,16 +217,21 @@ class TwoLevelPlanner(nn.Module):
         device = self.device
 
         z_start = self.world_model.encode(current_pixels.to(device))
+        z_start_pooled = self.world_model.pool(z_start)  # (1, D)
         z_goal = self.world_model.pool(
             self.world_model.encode(goal_pixels.to(device))
-        )
+        )  # (1, D)
 
         # ============================================================
-        # Level 1: Coarse CEM — find best coarse action sequence
+        # Level 1: Coarse CEM with inverse dynamics warm-start
         # ============================================================
 
-        mu_c = torch.zeros(K, self.coarse_action_dim, device=device)
-        sigma_c = torch.ones(K, self.coarse_action_dim, device=device)
+        if invdyn_init:
+            mu_c = self._coarse_invdyn_init(z_start_pooled, z_goal, K)
+            sigma_c = torch.full_like(mu_c, init_sigma)
+        else:
+            mu_c = torch.zeros(K, self.coarse_action_dim, device=device)
+            sigma_c = torch.ones(K, self.coarse_action_dim, device=device)
 
         for _ in range(coarse_cem_steps):
             noise = torch.randn(
@@ -152,8 +239,7 @@ class TwoLevelPlanner(nn.Module):
             )
             candidates = (mu_c.unsqueeze(0) + sigma_c.unsqueeze(0) * noise).clamp(-3, 3)
 
-            # Rollout each candidate
-            z = self.world_model.pool(z_start).unsqueeze(0).expand(coarse_cem_samples, -1)
+            z = z_start_pooled.expand(coarse_cem_samples, -1)
             for k in range(K):
                 z_tokens = z.unsqueeze(1).expand(-1, num_tokens, -1)
                 z = self.world_model.coarse_predictor(z_tokens, candidates[:, k])
@@ -167,26 +253,32 @@ class TwoLevelPlanner(nn.Module):
 
         best_coarse_actions = mu_c  # (K, coarse_action_dim)
 
-        # Compute waypoints from best coarse actions
-        waypoints = [self.world_model.pool(z_start)]
-        z = waypoints[0]
+        # Compute waypoints
+        waypoints = [z_start_pooled.squeeze(0)]  # (D,)
+        z = z_start_pooled
         for k in range(K):
             z_tokens = z.unsqueeze(1).expand(-1, num_tokens, -1)
-            z = self.world_model.coarse_predictor(z_tokens, best_coarse_actions[k].unsqueeze(0))
+            z = self.world_model.coarse_predictor(
+                z_tokens, best_coarse_actions[k].unsqueeze(0)
+            )
             waypoints.append(z.squeeze(0))
 
         # ============================================================
-        # Level 2: Fine CEM — fill in between each pair of waypoints
+        # Level 2: Fine CEM with inverse dynamics warm-start
         # ============================================================
 
         all_fine_actions = []
 
         for k in range(K):
-            z_seg_start = waypoints[k].unsqueeze(0)         # (1, D)
-            z_seg_target = waypoints[k + 1].unsqueeze(0)    # (1, D)
+            z_seg_start = waypoints[k].unsqueeze(0)       # (1, D)
+            z_seg_target = waypoints[k + 1].unsqueeze(0)  # (1, D)
 
-            mu_f = torch.zeros(h, self.fine_action_dim, device=device)
-            sigma_f = torch.ones(h, self.fine_action_dim, device=device)
+            if invdyn_init:
+                mu_f = self._fine_invdyn_init(z_seg_start, z_seg_target, h)
+                sigma_f = torch.full_like(mu_f, init_sigma)
+            else:
+                mu_f = torch.zeros(h, self.fine_action_dim, device=device)
+                sigma_f = torch.ones(h, self.fine_action_dim, device=device)
 
             for _ in range(fine_cem_steps):
                 noise = torch.randn(
@@ -194,13 +286,14 @@ class TwoLevelPlanner(nn.Module):
                 )
                 candidates = (mu_f.unsqueeze(0) + sigma_f.unsqueeze(0) * noise).clamp(-3, 3)
 
-                # Rollout
                 z = z_seg_start.expand(fine_cem_samples, -1)
                 cond = z_seg_target.expand(fine_cem_samples, -1)
 
                 for t in range(h):
                     z_tokens = z.unsqueeze(1).expand(-1, num_tokens, -1)
-                    z = self.world_model.fine_predictor(z_tokens, candidates[:, t], cond)
+                    z = self.world_model.fine_predictor(
+                        z_tokens, candidates[:, t], cond
+                    )
 
                 costs = (z - z_seg_target).pow(2).sum(dim=-1)
 
@@ -209,7 +302,6 @@ class TwoLevelPlanner(nn.Module):
                 mu_f = top.mean(dim=0)
                 sigma_f = top.std(dim=0).clamp(min=0.01)
 
-            # Decode fine latent actions → real actions
             for t in range(h):
                 real_action = self.fine_dec(mu_f[t].unsqueeze(0)).squeeze(0)
                 all_fine_actions.append(real_action)
@@ -217,10 +309,16 @@ class TwoLevelPlanner(nn.Module):
         return all_fine_actions
 
 
+# ================================================================
+# Cost model for swm.CEMSolver compatibility
+# ================================================================
+
+
 class TwoLevelCostModel(nn.Module):
     """Cost model compatible with swm.CEMSolver interface.
 
     Uses coarse-level rollout for fast evaluation of candidate action sequences.
+    Also uses inverse dynamics for warm-start when available.
     """
 
     def __init__(
@@ -263,11 +361,7 @@ class TwoLevelCostModel(nn.Module):
         info_dict: dict,
         candidates: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Evaluate candidates using hierarchical rollout.
-
-        Compatible with swm.solver.CEMSolver interface.
-        """
+        """Evaluate candidates using hierarchical rollout."""
         pixels = info_dict["pixels"][:, :, -1].to(self.device, dtype=torch.float32)
 
         if "goal_proprio" in info_dict:
@@ -292,7 +386,9 @@ class TwoLevelCostModel(nn.Module):
         ).to(self.device, dtype=torch.float32)
 
         total_steps = horizon * action_block
-        actions_flat = actions.reshape(batch_size * num_samples, total_steps, self.action_dim)
+        actions_flat = actions.reshape(
+            batch_size * num_samples, total_steps, self.action_dim
+        )
 
         BxS = batch_size * num_samples
         num_coarse_steps = total_steps // h
