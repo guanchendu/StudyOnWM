@@ -189,17 +189,20 @@ Step 1: online encoder 编码所有帧
 Step 2: target encoder 编码所有监督目标（无梯度）
   z^tgt[t] = target_encoder(o_t)              ← (B, num_tokens, D), t∈[1, Kh]
 
-Step 3: 细粒度逆动力学（GT pair → fine action）
+Step 3: 细粒度逆动力学（GT pair → fine action）  # 预测的是 从当前状态走到下一帧，最关键的那一步动作变化是什么
   â_t^fine = fine_inv(pool(all_z[t]), pool(all_z[t+1]))    ← t∈[0, Kh-1]
 
 Step 4: 粗粒度逆动力学（每段 GT pair → coarse action）
   â_k^coarse = coarse_inv(pool(all_z[kh]), pool(all_z[(k+1)h]))    ← k∈[0, K-1]
 
 Step 5: 多步 Coarse rollout（链式，梯度全程贯穿）
+'''
+从真实起点出发，连续使用粗粒度 latent action，链式地产生一串 h 步间隔的 waypoint，并让每个 waypoint 都对齐真实未来状态。
+'''
   z = all_z[0]
   for k in range(K):
       z = coarse_predictor(z, â_k^coarse)     ← 输出 (B, num_tokens, D)
-      z_coarse_pred[k] = z
+      z_coarse_pred[k] = z                       #### 这是把每一段预测出来的 waypoint 保存起来
       L_coarse_k = SmoothL1(z, z^tgt[(k+1)h-1])    ← token-level
 
   L_coarse = mean(L_coarse_0, ..., L_coarse_{K-1})
