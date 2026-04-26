@@ -40,6 +40,7 @@ from src_wm2.models import (
     FineActionDecoder,
     FineActionEncoder,
     MultiScaleInvDynWorldModel,
+    ProprioDecoder,
 )
 
 DEFAULT_CACHE_DIR = "/Users/guanchendu/Code/StudyOnWM/data"
@@ -103,28 +104,39 @@ def compute_phase2_loss(
     fine_dec: FineActionDecoder,
     coarse_enc: CoarseActionEncoder,
     coarse_dec: CoarseActionDecoder,
+    proprio_dec: ProprioDecoder,
     batch: dict[str, torch.Tensor],
+    lambda_proprio: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
-    Compute alignment loss at both scales.
+    Compute alignment loss at both scales + proprio decoding loss.
 
-    Data: pixels (B, T, C, H, W), action (B, T, action_dim), T >= h+1
+    Data: pixels (B, T, C, H, W), action (B, T, action_dim),
+          proprio (B, T, proprio_dim), T >= h+1
+
+    The proprio_dec is trained on BOTH encoder outputs AND predictor
+    outputs so it works on rolled-out latent states during planning.
     """
     pixels = batch["pixels"].float()
     actions = batch["action"].float()
+    proprio = batch["proprio"].float()
     h = phase1.horizon_h
 
     a_t = actions[:, 0]                           # (B, action_dim)
     actions_seq = actions[:, :h].flatten(1)        # (B, h * action_dim)
 
-    # ---- Frozen Phase 1: get latent actions ----
+    # ---- Frozen Phase 1: get latent states + actions + predictor outputs ----
     with torch.no_grad():
         z_0 = phase1.encode(pixels[:, 0])
         z_1 = phase1.encode(pixels[:, 1])
         z_h = phase1.encode(pixels[:, h])
 
-        a_hat_fine = phase1.compute_fine_action(z_0, z_1)       # (B, fine_action_dim)
-        a_hat_coarse = phase1.compute_coarse_action(z_0, z_h)   # (B, coarse_action_dim)
+        a_hat_fine = phase1.compute_fine_action(z_0, z_1)
+        a_hat_coarse = phase1.compute_coarse_action(z_0, z_h)
+
+        # Predictor outputs — proprio_dec must work on these too
+        z_h_pred = phase1.coarse_predictor(z_0, a_hat_coarse)
+        z_1_pred = phase1.fine_predictor(z_0, a_hat_fine, z_h_pred)
 
     # ---- Fine scale alignment ----
     a_tilde_fine = fine_enc(a_t)
@@ -144,10 +156,27 @@ def compute_phase2_loss(
     L_decode_coarse = F.mse_loss(a_recon_coarse, actions_seq)
     L_cycle_coarse = F.mse_loss(a_cycle_coarse, actions_seq)
 
+    # ---- Proprio decoding (encoder outputs) ----
+    L_p_enc = (
+        F.mse_loss(proprio_dec(z_0), proprio[:, 0])
+        + F.mse_loss(proprio_dec(z_1), proprio[:, 1])
+        + F.mse_loss(proprio_dec(z_h), proprio[:, h])
+    ) / 3
+
+    # ---- Proprio decoding (predictor outputs) ----
+    # Critical: planning cost is computed on predictor outputs,
+    # so proprio_dec must work on this distribution.
+    L_p_pred = (
+        F.mse_loss(proprio_dec(z_h_pred), proprio[:, h])
+        + F.mse_loss(proprio_dec(z_1_pred), proprio[:, 1])
+    ) / 2
+
+    L_proprio = L_p_enc + L_p_pred
+
     # ---- Total ----
     L_fine_total = L_align_fine + L_decode_fine + 0.5 * L_cycle_fine
     L_coarse_total = L_align_coarse + L_decode_coarse + 0.5 * L_cycle_coarse
-    L_total = L_fine_total + L_coarse_total
+    L_total = L_fine_total + L_coarse_total + lambda_proprio * L_proprio
 
     metrics = {
         "align_fine": L_align_fine.item(),
@@ -156,6 +185,8 @@ def compute_phase2_loss(
         "align_coarse": L_align_coarse.item(),
         "decode_coarse": L_decode_coarse.item(),
         "cycle_coarse": L_cycle_coarse.item(),
+        "proprio_enc": L_p_enc.item(),
+        "proprio_pred": L_p_pred.item(),
         "total_loss": L_total.item(),
     }
 
@@ -173,9 +204,11 @@ def run_epoch(
     fine_dec: FineActionDecoder,
     coarse_enc: CoarseActionEncoder,
     coarse_dec: CoarseActionDecoder,
+    proprio_dec: ProprioDecoder,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
+    lambda_proprio: float = 1.0,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     phase1.eval()
@@ -183,6 +216,7 @@ def run_epoch(
     fine_dec.train(is_train)
     coarse_enc.train(is_train)
     coarse_dec.train(is_train)
+    proprio_dec.train(is_train)
 
     accum = {}
     count = 0
@@ -192,7 +226,8 @@ def run_epoch(
 
         with torch.set_grad_enabled(is_train):
             loss, metrics = compute_phase2_loss(
-                phase1, fine_enc, fine_dec, coarse_enc, coarse_dec, batch,
+                phase1, fine_enc, fine_dec, coarse_enc, coarse_dec,
+                proprio_dec, batch, lambda_proprio,
             )
 
         if is_train:
@@ -227,6 +262,8 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden-dim-fine", type=int, default=128)
     parser.add_argument("--hidden-dim-coarse", type=int, default=256)
+    parser.add_argument("--hidden-dim-proprio", type=int, default=128)
+    parser.add_argument("--lambda-proprio", type=float, default=1.0)
     parser.add_argument("--train-split", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -284,12 +321,14 @@ def main():
         drop_last=False, num_workers=args.num_workers,
     )
 
-    # ---- Action dim from data ----
+    # ---- Action / proprio dim from data ----
     sample = next(iter(train_loader))
     action_dim = sample["action"].shape[-1]
+    proprio_dim = sample["proprio"].shape[-1]
     horizon_h = p1["horizon_h"]
     fine_action_dim = p1["fine_action_dim"]
     coarse_action_dim = p1["coarse_action_dim"]
+    latent_dim = p1["latent_dim"]
 
     # ---- Phase 2 models ----
     fine_enc = FineActionEncoder(action_dim, fine_action_dim, args.hidden_dim_fine).to(device)
@@ -300,10 +339,14 @@ def main():
     coarse_dec = CoarseActionDecoder(
         coarse_action_dim, action_dim, horizon_h, args.hidden_dim_coarse
     ).to(device)
+    proprio_dec = ProprioDecoder(
+        latent_dim, proprio_dim, args.hidden_dim_proprio
+    ).to(device)
 
     all_params = (
         list(fine_enc.parameters()) + list(fine_dec.parameters())
         + list(coarse_enc.parameters()) + list(coarse_dec.parameters())
+        + list(proprio_dec.parameters())
     )
     optimizer = torch.optim.Adam(all_params, lr=args.lr)
 
@@ -317,6 +360,7 @@ def main():
     print(f"label fraction     : {args.label_fraction:.1%}")
     print(f"dataset            : {len(dataset)} (train {len(train_set)} / val {len(val_set)})")
     print(f"action dim         : {action_dim}")
+    print(f"proprio dim        : {proprio_dim}")
     print(f"fine action dim    : {fine_action_dim}")
     print(f"coarse action dim  : {coarse_action_dim}")
     print(f"phase2 params      : {total_p2_params:,}")
@@ -328,19 +372,21 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         train_m = run_epoch(
-            phase1, fine_enc, fine_dec, coarse_enc, coarse_dec,
-            train_loader, device, optimizer,
+            phase1, fine_enc, fine_dec, coarse_enc, coarse_dec, proprio_dec,
+            train_loader, device, optimizer, args.lambda_proprio,
         )
         val_m = run_epoch(
-            phase1, fine_enc, fine_dec, coarse_enc, coarse_dec,
-            val_loader, device, None,
+            phase1, fine_enc, fine_dec, coarse_enc, coarse_dec, proprio_dec,
+            val_loader, device, None, args.lambda_proprio,
         )
 
         print(
             f"[{epoch:03d}] "
             f"train: af={train_m['align_fine']:.4f} df={train_m['decode_fine']:.4f} "
-            f"ac={train_m['align_coarse']:.4f} dc={train_m['decode_coarse']:.4f} | "
-            f"val: af={val_m['align_fine']:.4f} ac={val_m['align_coarse']:.4f}"
+            f"ac={train_m['align_coarse']:.4f} dc={train_m['decode_coarse']:.4f} "
+            f"pe={train_m['proprio_enc']:.4f} pp={train_m['proprio_pred']:.4f} | "
+            f"val: af={val_m['align_fine']:.4f} ac={val_m['align_coarse']:.4f} "
+            f"pe={val_m['proprio_enc']:.4f}"
         )
 
         if val_m["total_loss"] < best_val:
@@ -351,9 +397,11 @@ def main():
                     "fine_dec_state": fine_dec.state_dict(),
                     "coarse_enc_state": coarse_enc.state_dict(),
                     "coarse_dec_state": coarse_dec.state_dict(),
+                    "proprio_dec_state": proprio_dec.state_dict(),
                     "config": vars(args),
                     "phase1_config": p1,
                     "action_dim": action_dim,
+                    "proprio_dim": proprio_dim,
                     "best_val_loss": best_val,
                     "epoch": epoch,
                 },

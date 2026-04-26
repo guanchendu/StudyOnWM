@@ -132,152 +132,238 @@ v1: 输入 = z_t + [â_0^fine, ..., â_{h-1}^fine]    ← h 个细粒度动作�
 v2: 输入 = z_t + â^coarse                           ← 1 个粗粒度动作
     input_dim = latent_dim + coarse_action_dim       ← 固定大小，不受 h 影响
 
-网络: concat(z_pooled, â^coarse) → MLP → ẑ_{t+h}
-      (B, D + coarse_action_dim)        (B, D)
+网络: concat(z_pooled, â^coarse) → MLP → ẑ_{t+h}^tokens
+      (B, D + coarse_action_dim)         (B, num_tokens, D)
 ```
 
-**好处**：input_dim 不再依赖 h，可以灵活调整 h 而不改架构。
+**关键升级（vs v1）**：输出从 pooled `(B, D)` 改为 token 序列 `(B, num_tokens, D)`，
+让 multi-step rollout 时下一步输入有真实的 token 多样性，而不是 pooled→expand 的假 tokens。
+
+**好处**：
+- input_dim 不再依赖 h，灵活调整 h
+- 多步链式调用时与训练分布一致
 
 ### 3.5 Fine Predictor（Self-Attention + Cross-Attention）
 
-与 v1 结构一致，只是 action 输入换成 â^fine：
-
 ```
 输入:
-  z_t:       (B, num_tokens, D)     ← 当前 latent tokens
-  â^fine:    (B, fine_action_dim)   ← 细粒度 latent action
-  cond:      (B, D)                 ← 粗粒度预测的 waypoint ẑ_{t+h}
+  z_t:       (B, num_tokens, D)              ← 当前 latent tokens
+  â^fine:    (B, fine_action_dim)            ← 细粒度 latent action
+  cond:      (B, num_tokens, D) 或 (B, D)    ← 粗粒度 waypoint ẑ_{t+h}
 
 内部:
   action_token = proj(â^fine)                      ← (B, 1, D)
   x = concat([z_t tokens, action_token])           ← (B, N+1, D)
-  coarse_kv = proj(cond)                           ← (B, 1, D)
-  
+  coarse_kv = proj(cond)                           ← (B, num_tokens, D) — 多 token KV
+
   for block in transformer_blocks:
       x = self_attention(x)                        ← tokens 互相 attend
-      x = cross_attention(Q=x, K/V=coarse_kv)     ← 从粗粒度获取方向
+      x = cross_attention(Q=x, K/V=coarse_kv)     ← 从粗粒度多个 token 获取上下文
       x = ffn(x)
-  
-  ẑ_{t+1} = output_proj(mean_pool(x))             ← (B, D)
+
+  ẑ_{t+1}^tokens = output_proj(x[:, :N, :])       ← (B, num_tokens, D)
+                                                     丢弃 action_token 位置
 ```
+
+**关键升级（vs v1）**：
+- 输出 token 序列 `(B, num_tokens, D)` 而非 pooled `(B, D)`，支持多步 rollout
+- coarse_cond 也接受 token 序列，cross-attention 有更丰富的 KV 上下文
 
 ---
 
 ## 4. 阶段一训练细节
 
-### 4.1 数据流（单个样本）
+### 4.1 数据流（单个样本，K 段 coarse + 多步链式 rollout）
+
+**关键设计**：训练时的 rollout 分布要尽量与规划时一致。
+- 规划时 coarse predictor 链式 K 段 → 训练时也 K 段
+- 规划时 fine predictor 链式 h 步 → 训练时也 h 步
+- 规划时 fine 段 k≥1 起点是 coarse 输出 → 训练时也如此
 
 ```
-输入: 视频帧 [o_0, o_1, ..., o_h]    ← 不需要动作标签
+输入: 视频帧 [o_0, o_1, ..., o_{Kh}]    ← 共 Kh+1 帧（默认 K=2 → 11 帧）
 
-Step 1: 用 online encoder 编码所有帧（需要梯度）
-  z_0 = encoder(o_0)
-  z_1 = encoder(o_1)
-  ...
-  z_h = encoder(o_h)
+Step 1: online encoder 编码所有帧
+  all_z[t] = encoder(o_t)                      ← (B, num_tokens, D), t∈[0, Kh]
 
-Step 2: 用 target encoder 编码监督目标（无梯度）
-  z_1^tgt = target_encoder(o_1).mean(dim=1)    ← (B, D)
-  z_h^tgt = target_encoder(o_h).mean(dim=1)    ← (B, D)
+Step 2: target encoder 编码所有监督目标（无梯度）
+  z^tgt[t] = target_encoder(o_t)              ← (B, num_tokens, D), t∈[1, Kh]
 
-Step 3: 细粒度逆动力学
-  â_0^fine = fine_inv(pool(z_0), pool(z_1))
-  â_1^fine = fine_inv(pool(z_1), pool(z_2))
-  ...
-  â_{h-1}^fine = fine_inv(pool(z_{h-1}), pool(z_h))
+Step 3: 细粒度逆动力学（GT pair → fine action）
+  â_t^fine = fine_inv(pool(all_z[t]), pool(all_z[t+1]))    ← t∈[0, Kh-1]
 
-Step 4: 粗粒度逆动力学
-  â^coarse = coarse_inv(pool(z_0), pool(z_h))   ← 只算一次，跨 h 步
+Step 4: 粗粒度逆动力学（每段 GT pair → coarse action）
+  â_k^coarse = coarse_inv(pool(all_z[kh]), pool(all_z[(k+1)h]))    ← k∈[0, K-1]
 
-Step 5: 粗粒度预测
-  ẑ_h = coarse_predictor(z_0, â^coarse)
-  L_coarse = SmoothL1(ẑ_h, z_h^tgt)
+Step 5: 多步 Coarse rollout（链式，梯度全程贯穿）
+  z = all_z[0]
+  for k in range(K):
+      z = coarse_predictor(z, â_k^coarse)     ← 输出 (B, num_tokens, D)
+      z_coarse_pred[k] = z
+      L_coarse_k = SmoothL1(z, z^tgt[(k+1)h-1])    ← token-level
 
-Step 6: 细粒度预测（带 curriculum）
-  coarse_cond = blend(ẑ_h, z_h^tgt, curriculum_ratio)
-  ẑ_1 = fine_predictor(z_0, â_0^fine, coarse_cond)
-  L_fine = SmoothL1(ẑ_1, z_1^tgt)
+  L_coarse = mean(L_coarse_0, ..., L_coarse_{K-1})
 
-Step 7: 正则化
-  L_reg_fine   = mean(||â^fine||²) + variance_reg(â^fine)
-  L_reg_coarse = mean(||â^coarse||²) + variance_reg(â^coarse)
+Step 6: 多步 Fine rollout（每段独立 + scheduled sampling）
+  teacher_forcing_ratio = max(0, 1 - curriculum_ratio)
+
+  for k in range(K):
+      coarse_cond = curriculum × z_coarse_pred[k] + (1-curriculum) × z^tgt[(k+1)h-1]
+
+      # 段起点：k=0 用真实 encoder，k>0 用 coarse 输出（与规划一致）
+      z_pred = all_z[0] if k == 0 else z_coarse_pred[k-1]
+
+      for t in range(h):
+          global_t = k*h + t
+          z_pred = fine_predictor(z_pred, â_{global_t}^fine, coarse_cond)
+          L_fine_{global_t} = SmoothL1(z_pred, z^tgt[global_t])    ← token-level
+
+          # Scheduled sampling: 用 GT 替换下一步输入（教学减弱）
+          if t < h-1 and rand() < teacher_forcing_ratio:
+              z_pred = all_z[global_t + 1]
+
+  L_fine = mean(L_fine_0, ..., L_fine_{Kh-1})
+
+Step 7: 正则化（聚合所有段）
+  L_reg_fine   = ||all_â^fine||² + variance_reg(all_â^fine)
+  L_reg_coarse = ||all_â^coarse||² + variance_reg(all_â^coarse)
 
 Step 8: 总 loss
-  L = L_fine + λ_c * L_coarse + λ_rf * L_reg_fine + λ_rc * L_reg_coarse
+  L = L_fine + λ_c × L_coarse + λ_rf × L_reg_fine + λ_rc × L_reg_coarse
 ```
 
-### 4.2 多步细粒度训练（可选增强）
+### 4.2 多步 rollout 设计要点
 
-除了只预测 z_1，还可以 rollout 多步细粒度预测来训练：
+#### 为什么要多步链式？
+
+单步训练 → 多步规划 = compounding error。Predictor 从未见过自己的输出作为输入，
+规划时累积误差快速发散。链式训练让 predictor 学会容忍自己的预测误差。
+
+#### 为什么 coarse 也要多步？（v2 关键升级）
+
+规划阶段 coarse predictor 链式 K 次（生成 K+1 个 waypoint），但 v1/早期 v2 只单步训练。
+现在 K_train ≥ 2，coarse predictor 在第二段时输入是自己的输出，与规划匹配。
+
+#### 为什么 fine 段 k>0 起点用 coarse 输出？
+
+规划时 `waypoints[k]`（k≥1）= coarse_predictor 的链式输出。Fine predictor 必须
+学会从这种输入起步预测。训练时段 1 起点 z_pred = z_coarse_pred[0] 就是这个分布。
+
+#### 梯度策略
+
+- coarse rollout：**不 detach**，让 segment 1 的 loss 反向传到 segment 0 的 coarse_predictor，
+  使其学会预测对后续步骤友好的状态
+- fine rollout 内部：**不 detach**，h 步链都贯穿梯度
+- coarse_cond 喂给 fine：**detach**（保持各 scale 训练信号纯净）
+- 段间 fine 起点 z_coarse_pred[k-1]：**不 detach**（让 fine loss 也帮 coarse 学习）
+
+### 4.3 Curriculum Learning + Teacher Forcing
+
+两个 schedule 协同：
 
 ```
-ẑ_1 = fine_predictor(z_0,       â_0^fine, coarse_cond)  → L_fine_0
-ẑ_2 = fine_predictor(ẑ_1_token, â_1^fine, coarse_cond)  → L_fine_1
-...
+curriculum_ratio       = min(1, epoch / (total_epochs × 0.7))     ← 0 → 1
+teacher_forcing_ratio  = max(0, 1 - curriculum_ratio)             ← 1 → 0
 
-L_fine = mean(L_fine_0, L_fine_1, ..., L_fine_{h-1})
+训练前期 (cur=0):
+  coarse_cond = z^tgt          ← 用真实 EMA 目标作 cond，让 fine 先学
+  teacher_forcing = 1.0        ← fine 链式时基本都用 GT 替换，避免噪声雪崩
+
+训练后期 (cur=1):
+  coarse_cond = ẑ_coarse       ← 用 coarse predictor 输出（贴近规划）
+  teacher_forcing = 0.0        ← fine 链式全用自己的输出（贴近规划）
 ```
 
-这样 fine predictor 也会学到多步 rollout 的鲁棒性。但实现上更复杂，可以作为后续改进。
-
-### 4.3 Curriculum Learning
-
-与 v1 一致：
-
-```
-curriculum_ratio = min(1.0, epoch / (total_epochs × 0.7))
-
-coarse_cond = ratio × ẑ_h.detach() + (1 - ratio) × z_h^tgt
-
-训练前期: 用 GT，让 fine predictor 先学会基本预测
-训练后期: 用 coarse predictor 预测值，贴近推理场景
-```
+**协同的逻辑**：训练前期 predictor 还没学会，链式输出全是噪声；如果不 teacher force，
+loss 信号被噪声掩盖。后期模型成熟，让链式贯通才能学到鲁棒性。
 
 ---
 
-## 5. 阶段二：动作空间对齐
+## 5. 阶段二：动作空间对齐 + Proprio 解码
 
-### 5.1 两对翻译器
+### 5.1 三组翻译器
 
 ```
 细粒度翻译器（和 v1 一样）:
   FineActionEncoder:  a_t (action_dim) → ã^fine (fine_action_dim)
   FineActionDecoder:  â^fine (fine_action_dim) → a_t (action_dim)
 
-粗粒度翻译器（新增）:
+粗粒度翻译器（v2 新增）:
   CoarseActionEncoder: [a_t, ..., a_{t+h-1}] (h × action_dim) → ã^coarse (coarse_action_dim)
   CoarseActionDecoder: â^coarse (coarse_action_dim) → [a_t, ..., a_{t+h-1}] (h × action_dim)
+
+Proprio 解码器（v2 新增，关键）:
+  ProprioDecoder: pool(z) (latent_dim) → proprio (proprio_dim)
 ```
 
 **粗粒度翻译器的含义**：
 - Encoder: 把 h 个具体动作"压缩"成一个抽象描述（和 coarse inverse dynamics 学出的对齐）
 - Decoder: 把一个抽象描述"展开"成 h 个具体动作
 
+**Proprio 解码器为什么必要**：
+
+旧版 `TwoLevelCostModel.get_cost` 直接拿潜空间向量的前几维和 proprio 比较：
+```python
+cost = (z_pooled[:, :proprio_dim] - goal_proprio)²    ← 假设 latent 前几维是 proprio
+```
+但 JEPA-style 训练没有任何信号让 latent 前几维对齐 proprio，这个假设错误。
+
+新设计用 `ProprioDecoder` 显式地学一个 latent → proprio 的映射：
+```python
+cost = (proprio_dec(pool(z)) - goal_proprio)²        ← 学过的映射
+```
+
+**关键训练细节**：proprio_dec 需要在两种 latent 分布上训练：
+- `encode(pixels[:, t])` 输出（encoder 空间）
+- `coarse_predictor(z, a)` / `fine_predictor(z, a, cond)` 输出（predictor 空间）
+
+规划时 cost 是在 rollout 后的 predictor 输出上计算，所以必须涵盖这种分布。
+
 ### 5.2 Loss
 
 ```
-# 冻结阶段一，用有标注数据 (o_t, a_t, ..., a_{t+h-1}, o_{t+1}, ..., o_{t+h})
+# 冻结阶段一，用有标注数据 (o_t, a_t, ..., a_{t+h-1}, proprio_t, ..., o_{t+h})
 
-# 从阶段一获取 latent actions（冻结）
-â^fine = fine_inv(encoder(o_t), encoder(o_{t+1}))
-â^coarse = coarse_inv(encoder(o_t), encoder(o_{t+h}))
+# 从阶段一获取 latent states + actions + predictor 输出（全部冻结）
+z_0 = encoder(o_0); z_1 = encoder(o_1); z_h = encoder(o_h)
+â^fine = fine_inv(pool(z_0), pool(z_1))
+â^coarse = coarse_inv(pool(z_0), pool(z_h))
 
-# 细粒度对齐
+# Predictor 输出（关键：proprio_dec 必须在这个分布上训练）
+ẑ_h = coarse_predictor(z_0, â^coarse)
+ẑ_1 = fine_predictor(z_0, â^fine, ẑ_h)
+
+# === 细粒度动作对齐 ===
 ã^fine = fine_action_encoder(a_t)
 L_align_fine = ||ã^fine - â^fine.detach()||²
 L_decode_fine = ||fine_action_decoder(â^fine) - a_t||²
 L_cycle_fine = ||fine_action_decoder(ã^fine) - a_t||²
 
-# 粗粒度对齐
-actions_seq = concat([a_t, ..., a_{t+h-1}])   ← (B, h * action_dim)
+# === 粗粒度动作对齐 ===
+actions_seq = concat([a_t, ..., a_{t+h-1}])
 ã^coarse = coarse_action_encoder(actions_seq)
 L_align_coarse = ||ã^coarse - â^coarse.detach()||²
 L_decode_coarse = ||coarse_action_decoder(â^coarse) - actions_seq||²
 L_cycle_coarse = ||coarse_action_decoder(ã^coarse) - actions_seq||²
 
+# === Proprio 解码（v2 新增）===
+# 在 encoder 输出上训练
+L_p_enc = mean(
+  ||proprio_dec(z_0) - proprio_0||²,
+  ||proprio_dec(z_1) - proprio_1||²,
+  ||proprio_dec(z_h) - proprio_h||²,
+)
+# 在 predictor 输出上训练（与规划 cost 路径对齐）
+L_p_pred = mean(
+  ||proprio_dec(ẑ_h) - proprio_h||²,
+  ||proprio_dec(ẑ_1) - proprio_1||²,
+)
+L_proprio = L_p_enc + L_p_pred
+
 # 总 loss
 L = (L_align_fine + L_decode_fine + 0.5 * L_cycle_fine)
   + (L_align_coarse + L_decode_coarse + 0.5 * L_cycle_coarse)
+  + λ_p × L_proprio
 ```
 
 ---
@@ -315,51 +401,56 @@ v2: 分两级搜索
   σ = 0.5                 ← 方差更小，在估计附近搜索即可
 ```
 
-### 6.3 完整流程（带 Warm-Start）
+### 6.3 完整流程（带 Warm-Start，与训练完全对齐）
 
 ```
-已知: o_0（当前观测），z_goal（目标 latent）
+已知: o_0（当前观测），o_goal（目标观测）
 设 H = 总 horizon, h = 粗粒度步长, K = H/h 段
 
-═══ 第一级：粗粒度规划（逆动力学初始化 + CEM 精调）═══
+  # 关键: goal 用 target encoder（而非 online encoder）
+  # 原因: 训练时监督目标由 EMA target encoder 产生，predictor 输出分布
+  #       与 target encoder 对齐而非 online encoder
+  z_0 = encoder(o_0)                       ← (1, num_tokens, D) tokens
+  z_goal = target_encoder(o_goal)          ← (1, num_tokens, D) tokens
 
-  z_0 = encoder(o_0)
+═══ 第一级：粗粒度规划（逆动力学初始化 + CEM 精调）═══
 
   # ---- Warm-Start: 逆动力学给出初始路径 ----
   z = z_0
   coarse_inits = []
   for k in range(K):
-    â^c = coarse_inv_dyn(z, z_goal)       ← 逆动力学估计
+    â^c = coarse_inv_dyn(pool(z), pool(z_goal))   ← 逆动力学估计
     coarse_inits.append(â^c)
-    z = coarse_predictor(z, â^c)          ← 用估计往前推，为下一段提供起点
+    z = coarse_predictor(z, â^c)                  ← 输出 tokens，用于下一步
 
   # ---- CEM 以逆动力学估计为初始化 ----
   μ_coarse = stack(coarse_inits)          ← 不是零向量！
   σ_coarse = 0.5                          ← 比随机初始化 σ=1 小
 
   for cem_iter in range(M1):
-    candidates = sample(μ_coarse, σ_coarse)   ← 在逆动力学估计附近采样
-    
-    for each candidate:
-      rollout with coarse_predictor → cost = ||ẑ_H - z_goal||²
+    candidates = sample(μ_coarse, σ_coarse)
+    z = z_0.expand(N, ...)                ← (N, num_tokens, D)
+    for k in range(K):
+      z = coarse_predictor(z, candidates[:, k])    ← 链式 K 步，全程 tokens
 
+    cost = sum_token_dim((z - z_goal)²)            ← Token-level cost
     top-k → update μ_coarse, σ_coarse
 
-  waypoints = rollout(z_0, best_coarse_actions)
+  waypoints = rollout(z_0, best_coarse_actions)    ← K+1 个 token 序列
 
 ═══ 第二级：细粒度规划（同样带 Warm-Start）═══
 
   for k in range(K):
-    z_start = waypoints[k]
-    z_target = waypoints[k+1]
+    z_start = waypoints[k]                ← (num_tokens, D), k=0 是 encoder, k>0 是 coarse 输出
+    z_target = waypoints[k+1]             ← (num_tokens, D)
 
     # ---- Warm-Start: 细粒度逆动力学逐步估计 ----
     z = z_start
     fine_inits = []
     for t in range(h):
-      â^f = fine_inv_dyn(z, z_target)     ← 逆动力学估计
+      â^f = fine_inv_dyn(pool(z), pool(z_target))
       fine_inits.append(â^f)
-      z = fine_predictor(z, â^f, cond=z_target)
+      z = fine_predictor(z, â^f, z_target)         ← coarse_cond 也是 tokens
 
     # ---- CEM 精调 ----
     μ_fine = stack(fine_inits)
@@ -367,7 +458,12 @@ v2: 分两级搜索
 
     for cem_iter in range(M2):
       candidates = sample(μ_fine, σ_fine)
-      rollout with fine_predictor → cost = ||ẑ - z_target||²
+      z = z_start.expand(N, ...)
+      cond = z_target.expand(N, ...)
+      for t in range(h):
+        z = fine_predictor(z, candidates[:, t], cond)    ← 链式 h 步
+
+      cost = sum_token_dim((z - z_target)²)              ← Token-level cost
       top-k → update μ_fine, σ_fine
 
     all_fine_actions.extend(best_fine_for_segment_k)
@@ -377,6 +473,18 @@ v2: 分两级搜索
   a_0_real = fine_action_decoder(all_fine_actions[0])
   执行 → 新观测 o_1 → 回到第一级 (receding horizon)
 ```
+
+**与训练分布的对齐点**（v2 关键升级）：
+
+| 维度 | 训练 | 规划 | 一致性 |
+|------|------|------|--------|
+| Coarse predictor 链式步数 | K_train=2 | K=4 | 都 ≥2，分布相近 |
+| Fine predictor 链式步数 | h | h | ✓ |
+| Fine 段 k=0 起点 | encoder(o_0) | encoder(o_0) | ✓ |
+| Fine 段 k>0 起点 | z_coarse_pred[k-1] | waypoints[k]=coarse 输出 | ✓ |
+| Coarse_cond 来源 | curriculum→coarse 输出 | waypoints[k+1]=coarse 输出 | ✓ |
+| 监督目标分布 | target_encoder | target_encoder(goal) | ✓ |
+| Loss / cost 维度 | token-level | token-level | ✓ |
 
 ### 6.4 逆动力学在训练 vs 规划中的角色
 
@@ -414,8 +522,6 @@ v2: 分两级搜索
 ```
 
 ### 6.6 规划效率对比
-
-### 6.3 规划效率对比
 
 ```
 假设: H=20, h=5, action_dim=4
@@ -525,6 +631,22 @@ Coarse Inverse Dynamics:
   6. 不同 coarse_action_dim: 32, 64, 128
   7. 不同 horizon_h: 3, 5, 10
   8. 有/无一致性 loss (L_consist)
+
+实验 F: 训练-规划对齐（v2 升级专项）
+  9. Predictor 输出: pooled (B, D) vs tokens (B, num_tokens, D)
+       → 验证 token 序列对多步 rollout 的必要性
+  10. Coarse_segments K_train = 1 vs 2 vs 4
+       → 验证 coarse 多步训练对长 horizon 规划的影响
+  11. Teacher forcing schedule:
+       (a) 全程 GT (tf=1)         → 训练快但与规划脱节
+       (b) 全程链式 (tf=0)         → 早期训练发散
+       (c) tf=1−curriculum (我们)   → 协同 schedule
+  12. Cost 函数: pooled vs token-level
+       → 验证 token-level cost 的判别力
+  13. Goal encoder: online vs target encoder
+       → 验证与 EMA 监督源对齐的影响
+  14. 段间 fine 起点: encoder(o_h) vs coarse_predictor(z_0, â^c)
+       → 验证训练分布与规划分布对齐
 ```
 
 ---

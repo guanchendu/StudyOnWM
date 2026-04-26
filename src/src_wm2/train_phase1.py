@@ -101,67 +101,113 @@ def compute_phase1_loss(
     model: MultiScaleInvDynWorldModel,
     batch: dict[str, torch.Tensor],
     curriculum_ratio: float = 0.0,
+    coarse_segments: int = 2,
     lambda_coarse: float = 1.0,
     lambda_reg_fine: float = 0.01,
     lambda_reg_coarse: float = 0.01,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
-    Phase 1 loss with multi-scale inverse dynamics.
+    Phase 1 loss with multi-scale inverse dynamics + multi-step rollout
+    at BOTH scales. Aligns training distribution with planning.
 
-    Data: pixels (B, T, C, H, W), T >= h+1. No action labels used.
+    Data: pixels (B, T, C, H, W), T >= K*h + 1. No action labels used.
 
     Steps:
-      1. Encode all frames (online encoder, with gradients)
-      2. Compute fine inverse dynamics: â^fine_t = inv_fine(z_t, z_{t+1})
-      3. Compute coarse inverse dynamics: â^coarse = inv_coarse(z_0, z_h)
-      4. Coarse prediction: ẑ_h = coarse_pred(z_0, â^coarse)
-      5. Fine prediction:   ẑ_1 = fine_pred(z_0, â^fine_0, cond)
-      6. Regularize both latent action spaces
+      1. Encode all frames (online encoder)
+      2. Fine inv dyn from GT pairs (all K*h steps)
+      3. Coarse inv dyn from GT pairs (all K segments)
+      4. Multi-step coarse rollout: ẑ_h, ẑ_{2h}, ..., ẑ_{Kh}
+      5. Multi-step fine rollout per segment with scheduled sampling.
+         Segment k starts from ẑ_{kh} (k>0) or all_z[0] (k=0),
+         matching planning where waypoints come from coarse predictor.
     """
     pixels = batch["pixels"].float()
-    B, T = pixels.shape[:2]
     h = model.horizon_h
+    K = coarse_segments
+    total_steps = K * h + 1
 
-    # ---- Step 1: Encode all frames with online encoder ----
+    # ---- Step 1: Online encoder for all frames needed ----
     all_z = []
-    for t in range(h + 1):
+    for t in range(total_steps):
         all_z.append(model.encode(pixels[:, t]))
 
     # ---- Step 2: Target encoder for supervision ----
+    # all_z_target[t-1] corresponds to pixels[:, t]
     with torch.no_grad():
-        z_1_target = model.pool(model.encode_target(pixels[:, 1]))
-        z_h_target = model.pool(model.encode_target(pixels[:, h]))
+        all_z_target = []
+        for t in range(1, total_steps):
+            all_z_target.append(model.encode_target(pixels[:, t]))
 
-    # ---- Step 3: Fine inverse dynamics (single-step) ----
+    # ---- Step 3: Fine inverse dynamics from GT pairs (all K*h steps) ----
     fine_actions = []
-    for t in range(h):
+    for t in range(K * h):
         a_fine = model.compute_fine_action(all_z[t], all_z[t + 1])
         fine_actions.append(a_fine)
 
-    # ---- Step 4: Coarse inverse dynamics (h-step) ----
-    a_coarse = model.compute_coarse_action(all_z[0], all_z[h])
+    # ---- Step 4: Coarse inverse dynamics from GT pairs (K segments) ----
+    coarse_actions = []
+    for k in range(K):
+        a_c = model.compute_coarse_action(all_z[k * h], all_z[(k + 1) * h])
+        coarse_actions.append(a_c)
 
-    # ---- Step 5: Coarse prediction ----
-    z_h_pred = model.coarse_predictor(all_z[0], a_coarse)
-    L_coarse = F.smooth_l1_loss(z_h_pred, z_h_target)
+    # ---- Step 5: Multi-step coarse rollout ----
+    # Segment 0: real encoder input → ẑ_h
+    # Segment k>0: predictor output input → ẑ_{(k+1)h}
+    # Gradients flow through the chain (no detach) — teaches robustness
+    # to compounding error.
+    z_coarse_preds = []
+    z = all_z[0]
+    coarse_losses = []
+    for k in range(K):
+        z = model.coarse_predictor(z, coarse_actions[k])
+        z_coarse_preds.append(z)
+        target = all_z_target[(k + 1) * h - 1]
+        coarse_losses.append(F.smooth_l1_loss(z, target))
+    L_coarse = sum(coarse_losses) / len(coarse_losses)
 
-    # ---- Step 6: Fine prediction with curriculum ----
-    with torch.no_grad():
-        coarse_cond = (
-            curriculum_ratio * z_h_pred.detach()
-            + (1.0 - curriculum_ratio) * z_h_target
-        )
+    # ---- Step 6: Multi-step fine rollout per segment (with scheduled sampling) ----
+    # Teacher forcing decreases as curriculum increases:
+    #   early training: ratio≈1 (mostly use GT z_t for next step's input)
+    #   late training: ratio≈0 (chain own predictions, like planning)
+    teacher_forcing_ratio = max(0.0, 1.0 - curriculum_ratio)
 
-    z_1_pred = model.fine_predictor(all_z[0], fine_actions[0], coarse_cond)
-    L_fine = F.smooth_l1_loss(z_1_pred, z_1_target)
+    fine_losses = []
+    for k in range(K):
+        # Coarse_cond for segment k: blend curriculum predicted vs target
+        with torch.no_grad():
+            coarse_cond = (
+                curriculum_ratio * z_coarse_preds[k].detach()
+                + (1.0 - curriculum_ratio) * all_z_target[(k + 1) * h - 1]
+            )
+
+        # Starting state: real encoder for k=0, predictor output for k>0
+        # (matches planning where waypoints come from coarse predictor)
+        if k == 0:
+            z_pred = all_z[0]
+        else:
+            z_pred = z_coarse_preds[k - 1]
+
+        for t in range(h):
+            global_t = k * h + t
+            z_pred = model.fine_predictor(
+                z_pred, fine_actions[global_t], coarse_cond
+            )
+            fine_losses.append(F.smooth_l1_loss(z_pred, all_z_target[global_t]))
+
+            # Scheduled sampling: replace next-step input with GT
+            if t < h - 1 and torch.rand(1).item() < teacher_forcing_ratio:
+                z_pred = all_z[global_t + 1]
+
+    L_fine = sum(fine_losses) / len(fine_losses)
 
     # ---- Step 7: Regularization ----
     all_fine_cat = torch.cat(fine_actions, dim=0)
     fine_l2, fine_var_reg, fine_var = compute_action_reg(all_fine_cat)
     L_reg_fine = fine_l2 + fine_var_reg
 
+    all_coarse_cat = torch.cat(coarse_actions, dim=0)
     coarse_l2, coarse_var_reg, coarse_var = compute_action_reg(
-        a_coarse, variance_threshold=0.1
+        all_coarse_cat, variance_threshold=0.1
     )
     L_reg_coarse = coarse_l2 + coarse_var_reg
 
@@ -182,8 +228,9 @@ def compute_phase1_loss(
         "fine_action_var": fine_var.mean().item(),
         "coarse_action_var": coarse_var.mean().item(),
         "fine_action_norm": all_fine_cat.norm(dim=-1).mean().item(),
-        "coarse_action_norm": a_coarse.norm(dim=-1).mean().item(),
+        "coarse_action_norm": all_coarse_cat.norm(dim=-1).mean().item(),
         "curriculum_ratio": curriculum_ratio,
+        "teacher_forcing_ratio": teacher_forcing_ratio,
     }
 
     return L_total, metrics
@@ -201,6 +248,7 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None,
     epoch: int,
     total_epochs: int,
+    coarse_segments: int = 2,
     lambda_coarse: float = 1.0,
     lambda_reg_fine: float = 0.01,
     lambda_reg_coarse: float = 0.01,
@@ -222,6 +270,7 @@ def run_epoch(
         with torch.set_grad_enabled(is_train):
             loss, metrics = compute_phase1_loss(
                 model, batch, curriculum_ratio,
+                coarse_segments,
                 lambda_coarse, lambda_reg_fine, lambda_reg_coarse,
             )
 
@@ -252,7 +301,10 @@ def parse_args():
     parser.add_argument("--cache-dir", type=str, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--img-size", type=int, default=64)
     parser.add_argument("--horizon-h", type=int, default=5)
-    parser.add_argument("--num-steps", type=int, default=8)
+    parser.add_argument("--coarse-segments", type=int, default=2,
+                        help="Chained coarse predictions during training (K_train)")
+    parser.add_argument("--num-steps", type=int, default=11,
+                        help="Frames per sample, must be >= coarse_segments * horizon_h + 1")
     parser.add_argument("--frameskip", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=100)
@@ -286,7 +338,10 @@ def main():
     else:
         device = torch.device("cpu")
 
-    assert args.num_steps > args.horizon_h
+    assert args.num_steps >= args.coarse_segments * args.horizon_h + 1, (
+        f"num_steps ({args.num_steps}) must be >= "
+        f"coarse_segments * horizon_h + 1 ({args.coarse_segments * args.horizon_h + 1})"
+    )
 
     dataset = build_dataset(
         args.cache_dir, args.img_size, args.num_steps, args.frameskip,
@@ -345,12 +400,14 @@ def main():
         train_m = run_epoch(
             model, train_loader, device, optimizer,
             epoch, args.epochs,
+            args.coarse_segments,
             args.lambda_coarse, args.lambda_reg_fine, args.lambda_reg_coarse,
             args.curriculum_warmup,
         )
         val_m = run_epoch(
             model, val_loader, device, None,
             epoch, args.epochs,
+            args.coarse_segments,
             args.lambda_coarse, args.lambda_reg_fine, args.lambda_reg_coarse,
             args.curriculum_warmup,
         )
@@ -361,7 +418,7 @@ def main():
             f"train: fine={train_m['fine_loss']:.4f} coarse={train_m['coarse_loss']:.4f} "
             f"fvar={train_m['fine_action_var']:.4f} cvar={train_m['coarse_action_var']:.4f} | "
             f"val: fine={val_m['fine_loss']:.4f} coarse={val_m['coarse_loss']:.4f} | "
-            f"cur={train_m['curriculum_ratio']:.2f}"
+            f"cur={train_m['curriculum_ratio']:.2f} tf={train_m['teacher_forcing_ratio']:.2f}"
         )
 
         if val_m["total_loss"] < best_val:

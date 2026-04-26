@@ -142,10 +142,14 @@ class CoarsePredictor(nn.Module):
 
     Unlike v1 which concatenated h fine actions, this takes a single
     coarse action abstraction. Input dimension is independent of h.
+
+    Outputs full token sequence (B, num_tokens, D) for multi-step rollout.
     """
 
-    def __init__(self, latent_dim: int, coarse_action_dim: int):
+    def __init__(self, latent_dim: int, coarse_action_dim: int, num_tokens: int):
         super().__init__()
+        self.num_tokens = num_tokens
+        self.latent_dim = latent_dim
         input_dim = latent_dim + coarse_action_dim
         hidden_dim = latent_dim * 2
         self.net = nn.Sequential(
@@ -153,9 +157,9 @@ class CoarsePredictor(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
+            nn.Linear(hidden_dim, num_tokens * latent_dim),
         )
+        self.norm = nn.LayerNorm(latent_dim)
 
     def forward(
         self, z_t: torch.Tensor, coarse_action: torch.Tensor
@@ -163,10 +167,11 @@ class CoarsePredictor(nn.Module):
         """
         z_t:           (B, num_tokens, D) — current latent tokens
         coarse_action: (B, coarse_action_dim)
-        Returns:       (B, D)
+        Returns:       (B, num_tokens, D)
         """
         z_pooled = z_t.mean(dim=1)
-        return self.net(torch.cat([z_pooled, coarse_action], dim=-1))
+        h = self.net(torch.cat([z_pooled, coarse_action], dim=-1))
+        return self.norm(h.view(-1, self.num_tokens, self.latent_dim))
 
 
 # ============================================================
@@ -221,6 +226,9 @@ class FinePredictor(nn.Module):
     """Predict z_{t+1} from z_t + â^fine, conditioned on coarse waypoint ẑ_{t+h}.
 
     Tokens: [z_t tokens, action_token] → Self-Attn + Cross-Attn from coarse → ẑ_{t+1}
+
+    Outputs full token sequence (B, num_tokens, D) for multi-step rollout.
+    coarse_cond can be tokens (B, num_tokens, D) or pooled (B, D).
     """
 
     def __init__(
@@ -264,18 +272,21 @@ class FinePredictor(nn.Module):
         """
         z_t:          (B, num_tokens, D)
         fine_action:  (B, fine_action_dim)
-        coarse_cond:  (B, D)
-        Returns:      (B, D)
+        coarse_cond:  (B, num_tokens, D) or (B, D)
+        Returns:      (B, num_tokens, D)
         """
+        N = z_t.shape[1]
         a_token = self.action_proj(fine_action)
         x = torch.cat([z_t, a_token.unsqueeze(1)], dim=1)
 
-        coarse_kv = self.coarse_proj(coarse_cond).unsqueeze(1)
+        coarse_kv = self.coarse_proj(coarse_cond)
+        if coarse_kv.dim() == 2:
+            coarse_kv = coarse_kv.unsqueeze(1)
 
         for block in self.blocks:
             x = block(x, coarse_kv)
 
-        x = x.mean(dim=1)
+        x = x[:, :N, :]
         return self.output_proj(self.output_norm(x))
 
 
@@ -378,6 +389,36 @@ class CoarseActionDecoder(nn.Module):
         return self.net(coarse_action)
 
 
+class ProprioDecoder(nn.Module):
+    """Decode latent state to proprioception space: z → proprio.
+
+    Trained in Phase 2 with labeled data. Used during planning to
+    convert predicted latent states into proprio for cost computation
+    against goal_proprio.
+
+    Trained on both encoder outputs AND predictor outputs to handle
+    the distribution seen during planning (where cost is computed on
+    rolled-out predictor states).
+    """
+
+    def __init__(self, latent_dim: int, proprio_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.proprio_dim = proprio_dim
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, proprio_dim),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """z: (B, num_tokens, D) or (B, D). Returns: (B, proprio_dim)."""
+        if z.dim() == 3:
+            z = z.mean(dim=1)
+        return self.net(z)
+
+
 # ============================================================
 # 6. Full Phase 1 Model
 # ============================================================
@@ -420,7 +461,7 @@ class MultiScaleInvDynWorldModel(nn.Module):
         self.fine_inv_dyn = FineInverseDynamics(latent_dim, fine_action_dim)
         self.coarse_inv_dyn = CoarseInverseDynamics(latent_dim, coarse_action_dim)
 
-        self.coarse_predictor = CoarsePredictor(latent_dim, coarse_action_dim)
+        self.coarse_predictor = CoarsePredictor(latent_dim, coarse_action_dim, num_tokens)
         self.fine_predictor = FinePredictor(
             latent_dim, fine_action_dim, nhead, num_fine_layers, dim_ff, dropout
         )
