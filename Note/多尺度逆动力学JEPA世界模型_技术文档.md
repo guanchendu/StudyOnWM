@@ -180,7 +180,7 @@ v2: 输入 = z_t + â^coarse                           ← 1 个粗粒度动作
 - 规划时 fine predictor 链式 h 步 → 训练时也 h 步
 - 规划时 fine 段 k≥1 起点是 coarse 输出 → 训练时也如此
 
-```
+```python
 输入: 视频帧 [o_0, o_1, ..., o_{Kh}]    ← 共 Kh+1 帧（默认 K=2 → 11 帧）
 
 Step 1: online encoder 编码所有帧
@@ -733,3 +733,422 @@ src/src_wm2/
 | train_phase2.py | +粗粒度对齐 loss |
 | planning.py | 重写为两级 CEM |
 | evaluate.py | 适配新的 planning 接口 |
+
+---
+
+## 12. Methodology(公式化描述)
+
+本节用统一的数学符号给出方法的完整定义,涵盖**模型组件**、**两阶段训练**与**两级规划推理**。
+
+### 12.1 符号约定
+
+| 符号 | 含义 |
+|------|------|
+| $o_t \in \mathbb{R}^{3 \times H \times W}$ $$a_t$$ | 第 $t$ 帧 RGB 观测 |
+| $a_t \in \mathbb{R}^{d_a}$ | 第 $t$ 步真实动作(仅阶段二可见) |
+| $p_t \in \mathbb{R}^{d_p}$ | 第 $t$ 步 proprioception |
+| $h$ | 粗粒度跳步数(segment 长度) |
+| $K$ | segment 数,总 horizon $H = Kh$ |
+| $N$ | encoder 输出 token 数 |
+| $D$ | latent 维度 |
+| $d_f, d_c$ | fine / coarse latent action 维度 |
+| $z_t \in \mathbb{R}^{N \times D}$ | online encoder 输出 |
+| $\bar z_t \in \mathbb{R}^{N \times D}$ | EMA target encoder 输出(无梯度) |
+| $\hat a^{f}_t \in \mathbb{R}^{d_f}$ | fine latent action |
+| $\hat a^{c}_k \in \mathbb{R}^{d_c}$ | 第 $k$ 段 coarse latent action |
+| $\theta, \bar\theta$ | online / target encoder 参数 |
+| $\mathrm{pool}(\cdot)$ | token 平均池化:$\mathbb{R}^{N\times D} \to \mathbb{R}^{D}$ |
+| $\mathrm{sg}[\cdot]$ | stop-gradient 算子 |
+
+### 12.2 模型组件
+
+**Encoder(online + EMA target)**
+
+$$
+z_t = E_\theta(o_t), \qquad \bar z_t = E_{\bar\theta}(o_t), \qquad \bar\theta \leftarrow \tau\,\bar\theta + (1-\tau)\,\theta
+$$
+
+其中 $\tau = 0.996$ 为动量系数。
+
+**双尺度逆动力学**
+
+$$
+\hat a^{f}_t   = \mathcal{I}_f\bigl(\mathrm{pool}(z_t),\, \mathrm{pool}(z_{t+1})\bigr)
+\quad \in \mathbb{R}^{d_f}
+$$
+
+$$
+\hat a^{c}_k   = \mathcal{I}_c\bigl(\mathrm{pool}(z_{kh}),\, \mathrm{pool}(z_{(k+1)h})\bigr)
+\quad \in \mathbb{R}^{d_c}
+$$
+
+**双尺度 Predictor**
+
+$$
+\hat z_{(k+1)h} = \mathcal{P}_c\bigl(z_{kh},\, \hat a^{c}_k\bigr)
+\quad \in \mathbb{R}^{N \times D}
+$$
+
+$$
+\hat z_{t+1} = \mathcal{P}_f\bigl(z_t,\, \hat a^{f}_t,\, c\bigr),
+\qquad c \in \mathbb{R}^{N \times D} \text{ 为 coarse condition}
+$$
+
+$\mathcal{P}_f$ 内部为 self-attention + cross-attention(Q 来自 $z_t$ 与 action token,KV 来自 $c$)。
+
+**Phase 2 翻译器与 proprio 解码器**
+
+$$
+\tilde a^{f}_t = \Phi_f(a_t),\qquad
+\hat a^{f}_t \xrightarrow{\Phi_f^{-1}} a_t
+$$
+
+$$
+\tilde a^{c}_k = \Phi_c(a_{kh:(k+1)h}),\qquad
+\hat a^{c}_k \xrightarrow{\Phi_c^{-1}} a_{kh:(k+1)h}
+$$
+
+$$
+\hat p_t = \Psi\bigl(\mathrm{pool}(z_t)\bigr) \in \mathbb{R}^{d_p}
+$$
+
+---
+
+### 12.3 阶段一:自监督预训练
+
+输入一段 $Kh+1$ 帧无标注视频 $\{o_0, o_1, \ldots, o_{Kh}\}$。
+
+#### 步骤 1 — 编码
+
+$$
+z_t = E_\theta(o_t),\ t \in [0, Kh]
+\qquad
+\bar z_t = E_{\bar\theta}(o_t),\ t \in [1, Kh]
+$$
+
+#### 步骤 2 — 提取 latent actions
+
+$$
+\hat a^{f}_t = \mathcal{I}_f\bigl(\mathrm{pool}(z_t), \mathrm{pool}(z_{t+1})\bigr),\quad t \in [0, Kh-1]
+$$
+
+$$
+\hat a^{c}_k = \mathcal{I}_c\bigl(\mathrm{pool}(z_{kh}), \mathrm{pool}(z_{(k+1)h})\bigr),\quad k \in [0, K-1]
+$$
+
+#### 步骤 3 — Coarse 链式 rollout
+
+令 $u_0 = z_0$,递推
+
+$$
+u_{k+1} = \mathcal{P}_c(u_k, \hat a^{c}_k),\quad k = 0,\ldots,K-1
+$$
+
+定义 $z^{c}_k := u_{k+1}$ 为第 $k$ 段 coarse 预测输出。Coarse loss:
+
+$$
+\mathcal{L}_{\text{coarse}} = \frac{1}{K}\sum_{k=0}^{K-1}\, \mathcal{S}\bigl(z^{c}_k,\ \bar z_{(k+1)h}\bigr)
+$$
+
+其中 $\mathcal{S}(\cdot,\cdot)$ 为 token-level SmoothL1:
+
+$$
+\mathcal{S}(x, y) = \frac{1}{ND}\sum_{i=1}^{N}\sum_{j=1}^{D} \mathrm{smooth}_{L_1}\bigl(x_{ij} - y_{ij}\bigr)
+$$
+
+#### 步骤 4 — Fine 链式 rollout(段独立 + scheduled sampling)
+
+设当前 epoch 比率
+
+$$
+\beta = \min\!\Bigl(1,\ \frac{\text{epoch}}{0.7\cdot \text{epochs}_{\max}}\Bigr) \in [0,1]
+\qquad
+\rho = 1 - \beta
+$$
+
+$\beta$ 为 curriculum 权重,$\rho$ 为 teacher-forcing 概率。
+
+第 $k$ 段的 coarse condition:
+
+$$
+c_k = \beta \cdot \mathrm{sg}[z^{c}_k] + (1-\beta)\cdot \bar z_{(k+1)h-1}
+$$
+
+段起点(与规划对齐):
+
+$$
+v^{(k)}_0 =
+\begin{cases}
+z_0, & k = 0 \\
+z^{c}_{k-1}, & k \geq 1
+\end{cases}
+$$
+
+段内 $h$ 步链式($t = 0,\ldots,h-1$,$\,g = kh + t$):
+
+$$
+v^{(k)}_{t+1} = \mathcal{P}_f\bigl(v^{(k)}_t,\ \hat a^{f}_g,\ c_k\bigr)
+$$
+
+每步 loss
+
+$$
+\ell_g = \mathcal{S}\bigl(v^{(k)}_{t+1},\ \bar z_{g+1}\bigr)
+$$
+
+Scheduled sampling(下一步输入随机替换为 GT):
+
+$$
+v^{(k)}_{t+1} \leftarrow
+\begin{cases}
+z_{g+1}, & \text{w.p. } \rho \text{ (only if } t < h-1) \\
+v^{(k)}_{t+1}, & \text{otherwise}
+\end{cases}
+$$
+
+Fine loss:
+
+$$
+\mathcal{L}_{\text{fine}} = \frac{1}{Kh}\sum_{g=0}^{Kh-1}\ell_g
+$$
+
+#### 步骤 5 — 防 collapse 正则
+
+设 batch 内所有 fine actions 集合 $\mathcal{A}_f = \{\hat a^{f}_g\}_{g}$,coarse 同理:
+
+$$
+\mathcal{L}_{\text{reg}}^{f} = \underbrace{\mathbb{E}_g\|\hat a^{f}_g\|_2^2}_{\text{magnitude}}
++ \lambda_v \underbrace{\max\!\bigl(0,\ \gamma - \sqrt{\mathrm{Var}(\mathcal{A}_f)+\epsilon}\bigr)}_{\text{variance}}
+$$
+
+$\mathcal{L}_{\text{reg}}^{c}$ 形式相同。
+
+#### 步骤 6 — 总目标
+
+$$
+\boxed{\;
+\mathcal{L}_{\text{phase1}}
+= \mathcal{L}_{\text{fine}}
++ \lambda_c\,\mathcal{L}_{\text{coarse}}
++ \lambda_{rf}\,\mathcal{L}_{\text{reg}}^{f}
++ \lambda_{rc}\,\mathcal{L}_{\text{reg}}^{c}
+\;}
+$$
+
+参数更新:
+
+$$
+\theta \leftarrow \theta - \eta\,\nabla_\theta \mathcal{L}_{\text{phase1}}
+\qquad
+\bar\theta \leftarrow \tau\bar\theta + (1-\tau)\theta
+$$
+
+**梯度通路总结**
+
+| 信号路径 | 是否反传 |
+|---|---|
+| coarse rollout 段间 $u_k \to u_{k+1}$ | ✓ 不 detach |
+| fine rollout 段内 $v_t \to v_{t+1}$ | ✓ 不 detach |
+| 段间起点 $z^{c}_{k-1} \to v^{(k)}_0$ | ✓ 不 detach(fine loss 也帮 coarse 学) |
+| coarse condition $z^{c}_k \to c_k$ | ✗ detach(stop-grad) |
+| 监督目标 $\bar z_t$ | ✗ EMA encoder 永远无梯度 |
+
+---
+
+### 12.4 阶段二:动作对齐 + Proprio 解码
+
+冻结 $\theta, \bar\theta, \mathcal{I}_f, \mathcal{I}_c, \mathcal{P}_f, \mathcal{P}_c$。在标注子集 $\mathcal{D}_{\text{lab}} = \{(o_t, a_{t:t+h}, p_{t:t+h})\}$ 上训练 $\Phi_f, \Phi_f^{-1}, \Phi_c, \Phi_c^{-1}, \Psi$。
+
+设
+
+$$
+z_0 = E_\theta(o_0),\quad z_1 = E_\theta(o_1),\quad z_h = E_\theta(o_h)
+$$
+
+$$
+\hat a^{f} = \mathcal{I}_f(\mathrm{pool}(z_0), \mathrm{pool}(z_1)),
+\quad
+\hat a^{c} = \mathcal{I}_c(\mathrm{pool}(z_0), \mathrm{pool}(z_h))
+$$
+
+$$
+\hat z_h = \mathcal{P}_c(z_0, \hat a^{c}),
+\quad
+\hat z_1 = \mathcal{P}_f(z_0, \hat a^{f}, \hat z_h)
+$$
+
+#### Fine 翻译器
+
+$$
+\mathcal{L}_{\text{align}}^{f} = \|\Phi_f(a_0) - \mathrm{sg}[\hat a^{f}]\|_2^2
+$$
+
+$$
+\mathcal{L}_{\text{dec}}^{f} = \|\Phi_f^{-1}(\hat a^{f}) - a_0\|_2^2,
+\quad
+\mathcal{L}_{\text{cyc}}^{f} = \|\Phi_f^{-1}(\Phi_f(a_0)) - a_0\|_2^2
+$$
+
+#### Coarse 翻译器(令 $\mathbf{a}_{0:h} = [a_0,\ldots,a_{h-1}]$)
+
+$$
+\mathcal{L}_{\text{align}}^{c} = \|\Phi_c(\mathbf{a}_{0:h}) - \mathrm{sg}[\hat a^{c}]\|_2^2
+$$
+
+$$
+\mathcal{L}_{\text{dec}}^{c} = \|\Phi_c^{-1}(\hat a^{c}) - \mathbf{a}_{0:h}\|_2^2,
+\quad
+\mathcal{L}_{\text{cyc}}^{c} = \|\Phi_c^{-1}(\Phi_c(\mathbf{a}_{0:h})) - \mathbf{a}_{0:h}\|_2^2
+$$
+
+#### Proprio 解码器
+
+在 encoder 与 predictor **两种 latent 分布**上训练:
+
+$$
+\mathcal{L}_{\text{prop}}
+= \frac{1}{3}\sum_{t \in \{0,1,h\}} \|\Psi(\mathrm{pool}(z_t)) - p_t\|_2^2
++ \frac{1}{2}\sum_{\hat z \in \{\hat z_1, \hat z_h\}} \|\Psi(\mathrm{pool}(\hat z)) - p_\bullet\|_2^2
+$$
+
+#### 总目标
+
+$$
+\boxed{\;
+\mathcal{L}_{\text{phase2}}
+= \bigl(\mathcal{L}_{\text{align}}^{f} + \mathcal{L}_{\text{dec}}^{f} + 0.5\,\mathcal{L}_{\text{cyc}}^{f}\bigr)
++ \bigl(\mathcal{L}_{\text{align}}^{c} + \mathcal{L}_{\text{dec}}^{c} + 0.5\,\mathcal{L}_{\text{cyc}}^{c}\bigr)
++ \lambda_p\,\mathcal{L}_{\text{prop}}
+\;}
+$$
+
+---
+
+### 12.5 推理:逆动力学 Warm-Start 的两级 CEM 规划
+
+输入:当前观测 $o_{\text{cur}}$、目标观测 $o_{\text{goal}}$、horizon $H = Kh$。
+
+#### 编码(目标用 EMA encoder)
+
+$$
+z^{(0)} = E_\theta(o_{\text{cur}}),
+\qquad
+z^{\star} = E_{\bar\theta}(o_{\text{goal}})
+$$
+
+#### 第一级:Coarse CEM
+
+**Step A — 逆动力学 warm-start**
+$$
+u_0 = z^{(0)};\quad
+\hat a^{c,\text{init}}_k = \mathcal{I}_c(\mathrm{pool}(u_k), \mathrm{pool}(z^{\star})),
+\quad u_{k+1} = \mathcal{P}_c(u_k, \hat a^{c,\text{init}}_k)
+$$
+
+初始化 CEM 分布:
+
+$$
+\boldsymbol{\mu}^{c,(0)} = [\hat a^{c,\text{init}}_0, \ldots, \hat a^{c,\text{init}}_{K-1}],
+\qquad
+\boldsymbol{\sigma}^{c,(0)} = 0.5 \cdot \mathbf{1}
+$$
+
+**Step B — CEM 迭代**($i = 1,\ldots,M_1$)
+
+采样 $S$ 条候选:
+
+$$
+A^{(s)} = \boldsymbol{\mu}^{c,(i-1)} + \boldsymbol{\sigma}^{c,(i-1)} \odot \boldsymbol{\epsilon}^{(s)},
+\quad \boldsymbol{\epsilon}^{(s)} \sim \mathcal{N}(0, I)
+$$
+
+链式 rollout:
+
+$$
+z^{(s)}_0 = z^{(0)},\quad
+z^{(s)}_{k+1} = \mathcal{P}_c(z^{(s)}_k, A^{(s)}_k),\ k=0,\ldots,K-1
+$$
+
+**Token-level cost**:
+
+$$
+J^{(s)} = \|z^{(s)}_K - z^{\star}\|_F^2 = \sum_{n=1}^{N}\sum_{j=1}^{D} \bigl(z^{(s)}_{K,nj} - z^{\star}_{nj}\bigr)^2
+$$
+
+取 top-$L$ 精英集合 $\mathcal{E}^{(i)} = \{A^{(s)} : J^{(s)} \in \text{top-}L\}$:
+
+$$
+\boldsymbol{\mu}^{c,(i)} = \frac{1}{L}\sum_{A \in \mathcal{E}^{(i)}} A,
+\qquad
+\boldsymbol{\sigma}^{c,(i)} = \mathrm{std}(\mathcal{E}^{(i)})
+$$
+
+收敛后取 $A^{c\star} = \boldsymbol{\mu}^{c,(M_1)}$,生成 **waypoints** $\{w_0,\ldots,w_K\}$:
+
+$$
+w_0 = z^{(0)},\qquad w_{k+1} = \mathcal{P}_c(w_k, A^{c\star}_k)
+$$
+
+#### 第二级:Fine CEM(对每段 $k$ 独立执行)
+
+记 $z^{\dagger} = w_k$,$\,z^{\ddagger} = w_{k+1}$。
+
+**Step A — Fine 逆动力学 warm-start**
+
+$$
+v_0 = z^{\dagger};\quad
+\hat a^{f,\text{init}}_t = \mathcal{I}_f(\mathrm{pool}(v_t), \mathrm{pool}(z^{\ddagger})),
+\quad v_{t+1} = \mathcal{P}_f(v_t, \hat a^{f,\text{init}}_t, z^{\ddagger})
+$$
+
+$$
+\boldsymbol{\mu}^{f,(0)} = [\hat a^{f,\text{init}}_0, \ldots, \hat a^{f,\text{init}}_{h-1}],\quad
+\boldsymbol{\sigma}^{f,(0)} = 0.5 \cdot \mathbf{1}
+$$
+
+**Step B — CEM 迭代**($j = 1,\ldots,M_2$)
+
+$$
+B^{(s)} = \boldsymbol{\mu}^{f,(j-1)} + \boldsymbol{\sigma}^{f,(j-1)} \odot \boldsymbol{\epsilon}^{(s)}
+$$
+
+$$
+v^{(s)}_0 = z^{\dagger},\quad
+v^{(s)}_{t+1} = \mathcal{P}_f(v^{(s)}_t, B^{(s)}_t, z^{\ddagger})
+$$
+
+$$
+J^{(s)} = \|v^{(s)}_h - z^{\ddagger}\|_F^2
+$$
+
+更新 $\boldsymbol{\mu}^{f}, \boldsymbol{\sigma}^{f}$ 同前。最终 $A^{f\star}_k = \boldsymbol{\mu}^{f,(M_2)}$。
+
+#### 解码与执行
+
+拼接所有段:$A^{f\star} = [A^{f\star}_0, \ldots, A^{f\star}_{K-1}] \in \mathbb{R}^{Kh \times d_f}$。
+
+逐步解码为真实动作:
+
+$$
+a^{\text{real}}_g = \Phi_f^{-1}(A^{f\star}_g),\quad g = 0,\ldots,Kh-1
+$$
+
+执行 $a^{\text{real}}_0$,接收新观测 $o^\prime$,**receding horizon** 重新规划。
+
+---
+
+### 12.6 训练 ↔ 推理一致性表
+
+| 维度 | 训练定义 | 推理定义 | 对齐机制 |
+|------|---------|---------|----------|
+| Coarse 起点 | $u_0 = z_0$ | $u_0 = z^{(0)} = E_\theta(o_{\text{cur}})$ | 同源 |
+| Coarse 段间起点 | $u_k$(predictor 输出) | $u_k = \mathcal{P}_c(u_{k-1},\cdot)$ | 同分布 |
+| Fine 段 0 起点 | $z_0$ | $w_0 = z^{(0)}$ | 同源 |
+| Fine 段 $k\geq 1$ 起点 | $z^{c}_{k-1}$ | $w_k = \mathcal{P}_c(\cdots)$ | 同分布 |
+| Coarse cond 来源 | $\beta z^{c}_k + (1-\beta)\bar z_\bullet \xrightarrow{\beta\to 1} z^{c}_k$ | $w_{k+1} = \mathcal{P}_c$ 输出 | curriculum 收敛 |
+| 监督/cost 目标 | $\bar z_t$(EMA) | $z^{\star} = E_{\bar\theta}(o_{\text{goal}})$ | 同 encoder |
+| Loss/cost 维度 | token-level $\sum_{n,j}$ | token-level $\|\cdot\|_F^2$ | 同度量 |
+| Predictor 输出形态 | $(N,D)$ tokens | $(N,D)$ tokens | 同形状 |
+
+这张对齐表是 v2 相对 v1 的核心改进体现:**所有训练时 predictor 看到的输入分布,在推理时都能被精确复现**,从根本上缓解 compounding error。
+
