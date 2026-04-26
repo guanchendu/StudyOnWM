@@ -207,8 +207,14 @@ Step 5: 多步 Coarse rollout（链式，梯度全程贯穿）
 
   L_coarse = mean(L_coarse_0, ..., L_coarse_{K-1})
 
+  
+'''
+coarse 决定“这一段大概要去哪”
+fine 决定“这一小步怎么走”
+Step 6 就是在每个 coarse 段内部，给 fine predictor 一个“段目标”，再让它拿着每一步的 fine latent action 连续滚动，并通过 scheduled sampling 从“老师带着走”逐步过渡到“自己走”。
+'''
 Step 6: 多步 Fine rollout（每段独立 + scheduled sampling）
-  teacher_forcing_ratio = max(0, 1 - curriculum_ratio)
+  teacher_forcing_ratio = max(0, 1 - curriculum_ratio)  ### 在段内滚动时，下一步输入到底用 更常用真实状态，防止一开始滚崩 ??? 更常用模型自己的预测，贴近规划时分布???
 
   for k in range(K):
       coarse_cond = curriculum × z_coarse_pred[k] + (1-curriculum) × z^tgt[(k+1)h-1]
@@ -217,7 +223,7 @@ Step 6: 多步 Fine rollout（每段独立 + scheduled sampling）
       z_pred = all_z[0] if k == 0 else z_coarse_pred[k-1]
 
       for t in range(h):
-          global_t = k*h + t
+          global_t = k*h + t    ##### global_t = k * h + t
           z_pred = fine_predictor(z_pred, â_{global_t}^fine, coarse_cond)
           L_fine_{global_t} = SmoothL1(z_pred, z^tgt[global_t])    ← token-level
 
@@ -326,6 +332,9 @@ cost = (proprio_dec(pool(z)) - goal_proprio)²        ← 学过的映射
 
 ```
 # 冻结阶段一，用有标注数据 (o_t, a_t, ..., a_{t+h-1}, proprio_t, ..., o_{t+h})
+"""
+Phase 2 在冻结 world model 的前提下，用少量有标签数据把 latent action 空间和真实动作空间对齐，同时把 latent state 空间和 proprio 目标空间对齐。
+"""
 
 # 从阶段一获取 latent states + actions + predictor 输出（全部冻结）
 z_0 = encoder(o_0); z_1 = encoder(o_1); z_h = encoder(o_h)
