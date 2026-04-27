@@ -231,7 +231,7 @@ Step 6: 多步 Fine rollout（每段独立 + scheduled sampling）
           if t < h-1 and rand() < teacher_forcing_ratio:
               z_pred = all_z[global_t + 1]
 
-  L_fine = mean(L_fine_0, ..., L_fine_{Kh-1})
+  L_fine = mean(L_fine_0, ..., L_fine_{Kh-1})   
 
 Step 7: 正则化（聚合所有段）
   L_reg_fine   = ||all_â^fine||² + variance_reg(all_â^fine)
@@ -239,6 +239,7 @@ Step 7: 正则化（聚合所有段）
 
 Step 8: 总 loss
   L = L_fine + λ_c × L_coarse + λ_rf × L_reg_fine + λ_rc × L_reg_coarse
+  #### 这个地方只拟合了 z 没有拟合 ground truth action maybe need some chages 
 ```
 
 ### 4.2 多步 rollout 设计要点
@@ -330,7 +331,7 @@ cost = (proprio_dec(pool(z)) - goal_proprio)²        ← 学过的映射
 
 ### 5.2 Loss
 
-```
+```python
 # 冻结阶段一，用有标注数据 (o_t, a_t, ..., a_{t+h-1}, proprio_t, ..., o_{t+h})
 """
 Phase 2 在冻结 world model 的前提下，用少量有标签数据把 latent action 空间和真实动作空间对齐，同时把 latent state 空间和 proprio 目标空间对齐。
@@ -346,10 +347,14 @@ z_0 = encoder(o_0); z_1 = encoder(o_1); z_h = encoder(o_h)
 ẑ_1 = fine_predictor(z_0, â^fine, ẑ_h)
 
 # === 细粒度动作对齐 ===
+"""
+ã^fine is 真实被编码的
+â^fine is 预测值
+"""
 ã^fine = fine_action_encoder(a_t)
-L_align_fine = ||ã^fine - â^fine.detach()||²
-L_decode_fine = ||fine_action_decoder(â^fine) - a_t||²
-L_cycle_fine = ||fine_action_decoder(ã^fine) - a_t||²
+L_align_fine = ||ã^fine - â^fine.detach()||²              ####让真实动作编码后靠近 Phase 1 latent actio
+L_decode_fine = ||fine_action_decoder(â^fine) - a_t||²    ### 让 Phase 1 latent action 能还原真实动作
+L_cycle_fine = ||fine_action_decoder(ã^fine) - a_t||²     #### 保证真实动作自己编码再解码不会丢信息
 
 # === 粗粒度动作对齐 ===
 actions_seq = concat([a_t, ..., a_{t+h-1}])

@@ -1,6 +1,14 @@
 """
 Evaluate Multi-Scale InvDyn World Model on TwoRoom.
 
+Two planner modes:
+  --planner-mode two_level   (default) — uses TwoLevelPlanner.plan_batch end-to-end.
+                                Coarse CEM + fine CEM + inverse-dynamics warm-start
+                                in latent space. Real actions come from fine_dec.
+  --planner-mode coarse_cem  — legacy path. swm.CEMSolver + TwoLevelCostModel.
+                                Searches in real-action space, only uses coarse
+                                predictor + proprio_dec for cost. Useful as ablation.
+
 Usage:
   cd /Users/guanchendu/Code/StudyOnWM/src
   conda run -n wm python -m src_wm2.evaluate \
@@ -33,7 +41,11 @@ import torch
 from stable_worldmodel.solver import CEMSolver
 from torchvision.transforms import v2 as transforms
 
-from src_wm2.planning import TwoLevelCostModel
+from src_wm2.planning import (
+    TwoLevelCostModel,
+    TwoLevelPlanner,
+    TwoLevelPlannerPolicy,
+)
 
 
 DEFAULT_CACHE_DIR = "/Users/guanchendu/Code/StudyOnWM/data"
@@ -140,25 +152,97 @@ def parse_args():
     p.add_argument("--goal-offset-steps", type=int, default=25)
     p.add_argument("--eval-budget", type=int, default=50)
     p.add_argument("--img-size", type=int, default=64)
-    p.add_argument("--horizon", type=int, default=5)
+
+    # Planner selection
+    p.add_argument("--planner-mode", type=str, default="two_level",
+                   choices=["two_level", "coarse_cem"],
+                   help="two_level uses TwoLevelPlanner end-to-end; coarse_cem uses legacy CEMSolver+TwoLevelCostModel")
+
+    # MPC config (shared)
+    p.add_argument("--horizon", type=int, default=5,
+                   help="Number of distinct planned actions per replan. "
+                        "For two_level mode, must equal num_coarse_segments * horizon_h.")
     p.add_argument("--receding-horizon", type=int, default=5)
-    p.add_argument("--action-block", type=int, default=5)
+    p.add_argument("--action-block", type=int, default=5,
+                   help="Each planned action is repeated this many env steps (frameskip).")
+
+    # Two-level planner CEM knobs
+    p.add_argument("--num-coarse-segments", type=int, default=None,
+                   help="K. Defaults to horizon // horizon_h.")
+    p.add_argument("--coarse-cem-samples", type=int, default=256)
+    p.add_argument("--coarse-cem-steps", type=int, default=10)
+    p.add_argument("--coarse-topk", type=int, default=32)
+    p.add_argument("--fine-cem-samples", type=int, default=256)
+    p.add_argument("--fine-cem-steps", type=int, default=10)
+    p.add_argument("--fine-topk", type=int, default=32)
+    p.add_argument("--invdyn-init", type=int, default=1,
+                   help="1 = warm-start CEM with inverse dynamics; 0 = random init (ablation).")
+    p.add_argument("--init-sigma", type=float, default=0.5)
+
+    # Legacy CEMSolver knobs (only used when --planner-mode coarse_cem)
     p.add_argument("--num-samples", type=int, default=300)
     p.add_argument("--cem-steps", type=int, default=30)
     p.add_argument("--topk", type=int, default=30)
     p.add_argument("--var-scale", type=float, default=1.0)
     p.add_argument("--solver-batch-size", type=int, default=25)
+
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--save-video", type=bool, default=True)
     p.add_argument("--output-json", type=str, default=None)
     return p.parse_args()
 
 
+def build_policy(args, device, process, transform):
+    """Build either the TwoLevelPlannerPolicy (default) or the legacy
+    WorldModelPolicy + CEMSolver + TwoLevelCostModel stack."""
+    plan_cfg = swm.PlanConfig(
+        horizon=args.horizon,
+        receding_horizon=args.receding_horizon,
+        action_block=args.action_block,
+    )
+
+    if args.planner_mode == "two_level":
+        planner = TwoLevelPlanner(args.phase1_ckpt, args.phase2_ckpt, device)
+        policy = TwoLevelPlannerPolicy(
+            planner=planner,
+            config=plan_cfg,
+            num_coarse_segments=args.num_coarse_segments,
+            coarse_cem_samples=args.coarse_cem_samples,
+            coarse_cem_steps=args.coarse_cem_steps,
+            coarse_topk=args.coarse_topk,
+            fine_cem_samples=args.fine_cem_samples,
+            fine_cem_steps=args.fine_cem_steps,
+            fine_topk=args.fine_topk,
+            invdyn_init=bool(args.invdyn_init),
+            init_sigma=args.init_sigma,
+            process=process,
+            transform=transform,
+        )
+        return policy
+
+    # coarse_cem (legacy)
+    cost_model = TwoLevelCostModel(args.phase1_ckpt, args.phase2_ckpt, device)
+    solver = CEMSolver(
+        model=cost_model,
+        batch_size=args.solver_batch_size,
+        num_samples=args.num_samples,
+        var_scale=args.var_scale,
+        n_steps=args.cem_steps,
+        topk=args.topk,
+        device=device,
+        seed=args.seed,
+    )
+    return swm.policy.WorldModelPolicy(
+        solver=solver,
+        config=plan_cfg,
+        process=process,
+        transform=transform,
+    )
+
+
 def main():
     args = parse_args()
     device = pick_device(args.device)
-
-    cost_model = TwoLevelCostModel(args.phase1_ckpt, args.phase2_ckpt, device)
 
     dataset = get_dataset(args.cache_dir)
     process = build_processors(dataset)
@@ -176,26 +260,7 @@ def main():
         image_shape=(224, 224),
     )
 
-    solver = CEMSolver(
-        model=cost_model,
-        batch_size=args.solver_batch_size,
-        num_samples=args.num_samples,
-        var_scale=args.var_scale,
-        n_steps=args.cem_steps,
-        topk=args.topk,
-        device=device,
-        seed=args.seed,
-    )
-    policy = swm.policy.WorldModelPolicy(
-        solver=solver,
-        config=swm.PlanConfig(
-            horizon=args.horizon,
-            receding_horizon=args.receding_horizon,
-            action_block=args.action_block,
-        ),
-        process=process,
-        transform=transform,
-    )
+    policy = build_policy(args, device, process, transform)
 
     eval_episodes, eval_start_idx, sampled_rows = sample_eval_starts(
         dataset, args.num_eval, args.goal_offset_steps, args.seed,
@@ -208,7 +273,7 @@ def main():
         {"method": "_set_goal_state", "args": {"goal_state": {"value": "goal_proprio"}}},
     ]
 
-    video_path = Path(args.phase1_ckpt).parent / "eval_videos"
+    video_path = Path(args.phase1_ckpt).parent / f"eval_videos_{args.planner_mode}"
 
     start_time = time.time()
     metrics = world.evaluate_from_dataset(
@@ -224,6 +289,7 @@ def main():
     elapsed = time.time() - start_time
 
     results = {
+        "planner_mode": args.planner_mode,
         "phase1_ckpt": str(args.phase1_ckpt),
         "phase2_ckpt": str(args.phase2_ckpt),
         "device": str(device),
@@ -233,18 +299,25 @@ def main():
             "episode_successes": np.asarray(metrics["episode_successes"]).astype(int).tolist(),
         },
         "evaluation_time_sec": elapsed,
+        "config": {
+            "horizon": args.horizon,
+            "receding_horizon": args.receding_horizon,
+            "action_block": args.action_block,
+            "invdyn_init": bool(args.invdyn_init),
+            "num_coarse_segments": args.num_coarse_segments,
+        },
     }
 
     output_json = (
         Path(args.output_json).expanduser().resolve()
         if args.output_json
-        else Path(args.phase1_ckpt).parent / "eval_multiscale_invdyn.json"
+        else Path(args.phase1_ckpt).parent / f"eval_{args.planner_mode}.json"
     )
     output_json.parent.mkdir(parents=True, exist_ok=True)
     output_json.write_text(json.dumps(results, indent=2, ensure_ascii=False) + "\n")
 
     print("=" * 72)
-    print("Evaluation: Multi-Scale InvDyn World Model")
+    print(f"Evaluation: Multi-Scale InvDyn ({args.planner_mode})")
     print("=" * 72)
     print(f"success_rate: {metrics['success_rate']:.2f}")
     print(f"time: {elapsed:.1f}s")
