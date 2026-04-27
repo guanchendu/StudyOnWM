@@ -6,15 +6,20 @@ Freeze all Phase 1 parameters. Train three lightweight networks:
   - ActionDecoder:  â_t (latent action) → a_t (real action)
   - ProprioDecoder: z (latent state)   → proprio  (used by planner cost)
 
-Losses:
-  L_align    = ||ã_t - â_t||²
-  L_decode   = ||decode(â_t) - a_t||²
-  L_cycle    = ||decode(encode(a_t)) - a_t||²
-  L_proprio  = MSE on encoder outputs + MSE on predictor outputs
-               (latter is critical: planning cost is computed on rolled-out z)
+Critical design (P1 fix): proprio_dec MUST be supervised on the EXACT
+predictor-output distribution that planning sees. Planning runs
+K-segment chained rollout where each segment's coarse and fine both
+start from the PREVIOUS segment's last fine output. So Phase 2 mirrors
+that rollout and supervises proprio_dec on every intermediate state.
 
-Sequences of length >= h+1 are loaded so we can reach z_h via the coarse
-predictor and supervise proprio_dec on its output too.
+Two rollouts are run, both supervising proprio_dec:
+  (a) IDM-action rollout — uses inv_dyn(z_t, z_{t+1}) as latent actions
+      (matches the distribution Phase 1 trained the predictors on)
+  (b) Real-action rollout — uses action_encoder(real_action) as latent
+      actions (matches the distribution planning actually uses)
+
+Sequences of length >= K*h+1 are loaded so the chained rollout can run
+end to end and proprio at every timestep is available for supervision.
 
 Usage:
   cd /Users/guanchendu/Code/StudyOnWM/src
@@ -66,7 +71,7 @@ def build_dataset(
     label_fraction: float = 1.0,
     seed: int = 42,
 ):
-    """Phase 2 needs sequences of length >= h+1 for proprio_dec on predictor outputs."""
+    """Phase 2 needs sequences of length >= K*h+1 for chained-rollout proprio supervision."""
     keys_to_load = ["pixels", "action", "proprio"]
     keys_to_cache = ["action", "proprio"]
 
@@ -102,6 +107,62 @@ def build_dataset(
 
 
 # ============================================================
+# Chained rollout matching planning
+# ============================================================
+
+
+def chained_rollout_proprio_loss(
+    phase1: HierarchicalInvDynWorldModel,
+    proprio_dec: ProprioDecoder,
+    z_start: torch.Tensor,                     # (B, num_tokens, D)
+    latent_actions_per_step: list,             # length K*h, each (B, latent_action_dim)
+    proprio_seq: torch.Tensor,                 # (B, K*h+1, proprio_dim)
+    K: int,
+    h: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run K-segment chained rollout (mirrors planning.hierarchical_rollout)
+    and supervise proprio_dec on:
+      - every fine-predictor output (target = proprio at the corresponding next-frame timestep)
+      - every coarse waypoint        (target = proprio at the segment-end timestep)
+
+    phase1 is frozen (no param updates), but gradients still flow through it
+    to update action_encoder and proprio_dec.
+    """
+    L_p_fine = 0.0
+    L_p_wp = 0.0
+    fine_count = 0
+
+    z_current = z_start
+    for k in range(K):
+        seg_actions = torch.stack(
+            latent_actions_per_step[k * h : (k + 1) * h], dim=1
+        )  # (B, h, latent_action_dim)
+
+        z_waypoint = phase1.coarse_predictor(z_current, seg_actions)
+        L_p_wp = L_p_wp + F.mse_loss(
+            proprio_dec(z_waypoint), proprio_seq[:, (k + 1) * h]
+        )
+
+        z_t = z_current
+        for t in range(h):
+            global_t = k * h + t
+            z_t = phase1.fine_predictor(
+                z_t, latent_actions_per_step[global_t], z_waypoint
+            )
+            # fine_predictor(z_t, action_t) predicts the next state, so proprio
+            # target is at index global_t + 1
+            L_p_fine = L_p_fine + F.mse_loss(
+                proprio_dec(z_t), proprio_seq[:, global_t + 1]
+            )
+            fine_count += 1
+
+        # Next segment starts from this segment's fine rollout output
+        z_current = z_t
+
+    return L_p_fine / max(1, fine_count), L_p_wp / K
+
+
+# ============================================================
 # Loss Computation
 # ============================================================
 
@@ -112,43 +173,33 @@ def compute_phase2_loss(
     action_dec: ActionDecoder,
     proprio_dec: ProprioDecoder,
     batch: dict[str, torch.Tensor],
+    K: int,
     lambda_proprio: float = 1.0,
+    lambda_real_path: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Action alignment + proprio decoding (encoder + predictor outputs).
+    """Action alignment + chained-rollout proprio supervision.
 
-    Pixels (B, T, C, H, W), action (B, T, action_dim), proprio (B, T, proprio_dim),
-    T >= h+1.
+    pixels  (B, T, C, H, W)         T >= K*h + 1
+    action  (B, T, action_dim)
+    proprio (B, T, proprio_dim)
     """
     pixels = batch["pixels"].float()
     actions = batch["action"].float()
     proprio = batch["proprio"].float()
     h = phase1.horizon_h
+    total = K * h + 1
 
-    a_t = actions[:, 0]                    # (B, action_dim)
-
-    # ---- Frozen Phase 1: get latent states + action + predictor outputs ----
+    # ---- Frozen Phase 1: encode all frames + IDM latent actions ----
     with torch.no_grad():
-        z_0 = phase1.encode(pixels[:, 0])          # (B, num_tokens, D)
-        z_1 = phase1.encode(pixels[:, 1])
-        z_h = phase1.encode(pixels[:, h])
+        all_z = [phase1.encode(pixels[:, t]) for t in range(total)]
+        idm_actions = [
+            phase1.compute_latent_action(all_z[t], all_z[t + 1])
+            for t in range(K * h)
+        ]
 
-        a_hat = phase1.compute_latent_action(z_0, z_1)  # (B, latent_action_dim)
-
-        # Stack h fine actions for the coarse predictor.
-        # We re-use a_hat for all h slots (rough proxy in the unlabeled
-        # setting); for labeled data the encoder maps real actions instead,
-        # but here proprio_dec only needs predictor outputs, not exact actions.
-        seg_actions = []
-        for t in range(h):
-            z_t_p = phase1.encode(pixels[:, t])
-            z_tp1 = phase1.encode(pixels[:, t + 1])
-            seg_actions.append(phase1.compute_latent_action(z_t_p, z_tp1))
-        seg_actions_stacked = torch.stack(seg_actions, dim=1)  # (B, h, la_dim)
-
-        z_h_pred = phase1.coarse_predictor(z_0, seg_actions_stacked)
-        z_1_pred = phase1.fine_predictor(z_0, seg_actions[0], z_h_pred)
-
-    # ---- Action alignment ----
+    # ---- Action alignment (single-step, t=0) ----
+    a_t = actions[:, 0]
+    a_hat = idm_actions[0]
     a_tilde = action_enc(a_t)
     a_recon = action_dec(a_hat)
     a_cycle = action_dec(a_tilde)
@@ -157,24 +208,36 @@ def compute_phase2_loss(
     L_decode = F.mse_loss(a_recon, a_t)
     L_cycle = F.mse_loss(a_cycle, a_t)
 
-    # ---- Proprio decoding (encoder outputs) ----
-    L_p_enc = (
-        F.mse_loss(proprio_dec(z_0), proprio[:, 0])
-        + F.mse_loss(proprio_dec(z_1), proprio[:, 1])
-        + F.mse_loss(proprio_dec(z_h), proprio[:, h])
-    ) / 3
+    # ---- Proprio: encoder outputs (cheap, broad coverage) ----
+    L_p_enc = sum(
+        F.mse_loss(proprio_dec(all_z[t]), proprio[:, t]) for t in range(total)
+    ) / total
 
-    # ---- Proprio decoding (predictor outputs) ----
-    # Critical: planning cost is computed on rolled-out predictor states,
-    # so proprio_dec must be in distribution on those.
-    L_p_pred = (
-        F.mse_loss(proprio_dec(z_h_pred), proprio[:, h])
-        + F.mse_loss(proprio_dec(z_1_pred), proprio[:, 1])
-    ) / 2
+    # ---- Proprio: chained rollout, IDM-action path ----
+    # Matches Phase 1 training distribution; phase1 already in no_grad above
+    # but proprio_dec must receive grad, so re-run rollout with grad enabled.
+    L_p_pred_idm, L_p_wp_idm = chained_rollout_proprio_loss(
+        phase1, proprio_dec, all_z[0], idm_actions, proprio, K, h,
+    )
 
-    L_proprio = L_p_enc + L_p_pred
+    # ---- Proprio: chained rollout, real-action path (planning distribution) ----
+    # action_encoder gradient flows here, so it learns to produce latent actions
+    # whose downstream rollout proprio matches reality.
+    real_actions_seq = actions[:, : K * h]                                # (B, K*h, A)
+    B, T_a, A = real_actions_seq.shape
+    real_la_flat = action_enc(real_actions_seq.reshape(B * T_a, A))
+    real_la = real_la_flat.reshape(B, T_a, -1)
+    real_la_per_step = [real_la[:, t] for t in range(T_a)]
+    L_p_pred_real, L_p_wp_real = chained_rollout_proprio_loss(
+        phase1, proprio_dec, all_z[0], real_la_per_step, proprio, K, h,
+    )
 
-    # ---- Total ----
+    L_proprio = (
+        L_p_enc
+        + 0.5 * (L_p_pred_idm + L_p_wp_idm)
+        + lambda_real_path * 0.5 * (L_p_pred_real + L_p_wp_real)
+    )
+
     L_action = L_align + L_decode + 0.5 * L_cycle
     L_total = L_action + lambda_proprio * L_proprio
 
@@ -183,7 +246,10 @@ def compute_phase2_loss(
         "decode": L_decode.item(),
         "cycle": L_cycle.item(),
         "proprio_enc": L_p_enc.item(),
-        "proprio_pred": L_p_pred.item(),
+        "proprio_idm_fine": L_p_pred_idm.item(),
+        "proprio_idm_wp": L_p_wp_idm.item(),
+        "proprio_real_fine": L_p_pred_real.item(),
+        "proprio_real_wp": L_p_wp_real.item(),
         "total_loss": L_total.item(),
     }
 
@@ -203,7 +269,9 @@ def run_epoch(
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
+    K: int,
     lambda_proprio: float = 1.0,
+    lambda_real_path: float = 1.0,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     phase1.eval()
@@ -220,7 +288,7 @@ def run_epoch(
         with torch.set_grad_enabled(is_train):
             loss, metrics = compute_phase2_loss(
                 phase1, action_enc, action_dec, proprio_dec,
-                batch, lambda_proprio,
+                batch, K, lambda_proprio, lambda_real_path,
             )
 
         if is_train:
@@ -243,21 +311,26 @@ def run_epoch(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Phase 2: Action alignment + ProprioDecoder"
+        description="Phase 2: Action alignment + ProprioDecoder (chained-rollout supervision)"
     )
     parser.add_argument("--phase1-ckpt", type=str, required=True)
     parser.add_argument("--cache-dir", type=str, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--img-size", type=int, default=64)
     parser.add_argument("--frameskip", type=int, default=5)
     parser.add_argument("--label-fraction", type=float, default=0.1)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden-dim", type=int, default=128,
                         help="Hidden dim for action encoder/decoder")
     parser.add_argument("--proprio-hidden-dim", type=int, default=128,
                         help="Hidden dim for proprio decoder")
+    parser.add_argument("--coarse-segments", type=int, default=None,
+                        help="K. Defaults to Phase 1 config's coarse_segments.")
     parser.add_argument("--lambda-proprio", type=float, default=1.0)
+    parser.add_argument("--lambda-real-path", type=float, default=1.0,
+                        help="Weight on the real-action rollout proprio loss "
+                             "(0 = only IDM rollout supervision)")
     parser.add_argument("--train-split", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -276,7 +349,13 @@ def main():
         device = torch.device("cpu")
 
     # ---- Load Phase 1 (frozen) ----
-    ckpt = torch.load(args.phase1_ckpt, map_location="cpu")
+    ckpt_path = Path(args.phase1_ckpt)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"Phase 1 checkpoint not found: {ckpt_path}\n"
+            f"Run train_phase1.py first to produce it."
+        )
+    ckpt = torch.load(ckpt_path, map_location="cpu")
     p1_cfg = ckpt["config"]
 
     phase1 = HierarchicalInvDynWorldModel(
@@ -294,7 +373,8 @@ def main():
     phase1.requires_grad_(False)
 
     h = p1_cfg["horizon_h"]
-    num_steps = h + 1  # need at least h+1 frames for proprio_dec on predictor outputs
+    K = args.coarse_segments if args.coarse_segments is not None else p1_cfg.get("coarse_segments", 2)
+    num_steps = K * h + 1
 
     # ---- Dataset ----
     dataset = build_dataset(
@@ -322,14 +402,12 @@ def main():
         drop_last=False, num_workers=args.num_workers,
     )
 
-    # ---- Read action_dim and proprio_dim from data ----
     sample = next(iter(train_loader))
     action_dim = sample["action"].shape[-1]
     proprio_dim = sample["proprio"].shape[-1]
     latent_action_dim = p1_cfg["latent_action_dim"]
     latent_dim = p1_cfg["latent_dim"]
 
-    # ---- Phase 2 networks ----
     action_enc = ActionEncoder(action_dim, latent_action_dim, args.hidden_dim).to(device)
     action_dec = ActionDecoder(latent_action_dim, action_dim, args.hidden_dim).to(device)
     proprio_dec = ProprioDecoder(latent_dim, proprio_dim, args.proprio_hidden_dim).to(device)
@@ -342,13 +420,15 @@ def main():
     optimizer = torch.optim.Adam(params, lr=args.lr)
 
     print("=" * 72)
-    print("Phase 2: Action Alignment + Proprio Decoder")
+    print("Phase 2: Action Alignment + Proprio Decoder (chained rollout)")
     print("=" * 72)
     print(f"device             : {device}")
-    print(f"phase1 checkpoint  : {args.phase1_ckpt}")
+    print(f"phase1 checkpoint  : {ckpt_path}")
     print(f"label fraction     : {args.label_fraction:.1%}")
     print(f"dataset size       : {len(dataset)}")
-    print(f"num_steps (h+1)    : {num_steps}")
+    print(f"horizon_h          : {h}")
+    print(f"coarse segments K  : {K}")
+    print(f"num_steps (K*h+1)  : {num_steps}")
     print(f"action_dim         : {action_dim}")
     print(f"proprio_dim        : {proprio_dim}")
     print(f"latent_action_dim  : {latent_action_dim}")
@@ -357,7 +437,6 @@ def main():
           f"proprio_dec={sum(p.numel() for p in proprio_dec.parameters()):,}")
     print("=" * 72)
 
-    # ---- Training ----
     output_dir = Path("outputs") / "hierarchical_invdyn"
     output_dir.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
@@ -365,18 +444,23 @@ def main():
     for epoch in range(1, args.epochs + 1):
         train_m = run_epoch(
             phase1, action_enc, action_dec, proprio_dec,
-            train_loader, device, optimizer, args.lambda_proprio,
+            train_loader, device, optimizer, K,
+            args.lambda_proprio, args.lambda_real_path,
         )
         val_m = run_epoch(
             phase1, action_enc, action_dec, proprio_dec,
-            val_loader, device, None, args.lambda_proprio,
+            val_loader, device, None, K,
+            args.lambda_proprio, args.lambda_real_path,
         )
 
         print(
             f"[{epoch:03d}] "
-            f"train: align={train_m['align']:.4f} dec={train_m['decode']:.4f} "
-            f"p_enc={train_m['proprio_enc']:.4f} p_pred={train_m['proprio_pred']:.4f} | "
-            f"val: align={val_m['align']:.4f} p_pred={val_m['proprio_pred']:.4f}"
+            f"align={train_m['align']:.4f} dec={train_m['decode']:.4f} | "
+            f"p_enc={train_m['proprio_enc']:.4f} "
+            f"idm_f={train_m['proprio_idm_fine']:.4f} "
+            f"real_f={train_m['proprio_real_fine']:.4f} | "
+            f"val: idm_f={val_m['proprio_idm_fine']:.4f} "
+            f"real_f={val_m['proprio_real_fine']:.4f}"
         )
 
         if val_m["total_loss"] < best_val:
@@ -388,6 +472,7 @@ def main():
                     "proprio_dec_state_dict": proprio_dec.state_dict(),
                     "config": vars(args),
                     "phase1_config": p1_cfg,
+                    "coarse_segments": K,
                     "action_dim": action_dim,
                     "proprio_dim": proprio_dim,
                     "best_val_loss": best_val,

@@ -174,7 +174,13 @@ def parse_args():
     parser.add_argument("--var-scale", type=float, default=1.0)
     parser.add_argument("--solver-batch-size", type=int, default=25)
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--save-video", type=bool, default=True)
+    # Use BooleanOptionalAction so `--no-save-video` works (Python 3.9+).
+    # Avoids the type=bool argparse trap where --save-video False → True.
+    parser.add_argument(
+        "--save-video",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--output-json", type=str, default=None)
     return parser.parse_args()
 
@@ -183,6 +189,16 @@ def main():
     args = parse_args()
 
     device = pick_device(args.device)
+
+    # ---- Verify checkpoints exist (avoid cryptic torch.load failures) ----
+    for label, ckpt_arg in (("phase1", args.phase1_ckpt), ("phase2", args.phase2_ckpt)):
+        if not Path(ckpt_arg).exists():
+            raise FileNotFoundError(
+                f"{label} checkpoint not found: {ckpt_arg}\n"
+                f"Train it first:\n"
+                f"  python -m src_wm.train_{label}"
+                + ("" if label == "phase1" else f" --phase1-ckpt {args.phase1_ckpt}")
+            )
 
     # ---- Load cost model ----
     cost_model = HierarchicalCostModel(

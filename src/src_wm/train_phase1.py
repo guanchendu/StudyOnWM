@@ -172,47 +172,56 @@ def compute_phase1_loss(
         a_hat = model.compute_latent_action(all_z[t], all_z[t + 1])
         latent_actions.append(a_hat)
 
-    # ---- Step 4: Multi-step coarse rollout (K segments) ----
-    z_coarse_preds = []
-    z = all_z[0]
+    # ---- Step 4+5: Unified chained rollout matching planning ----
+    # Planning structure (planning.py::hierarchical_rollout):
+    #   for each segment k:
+    #     z_waypoint = coarse_predictor(z_current, seg_actions_k)
+    #     z_t = z_current
+    #     for t in 0..h-1:
+    #         z_t = fine_predictor(z_t, action_t, z_waypoint)
+    #     z_current = z_t          # ← next segment's coarse AND fine start from FINE output
+    #
+    # We mirror that here so train/planning rollout distributions match:
+    #   - segment 0 starts from real encoder z_0
+    #   - segment k>0 (both coarse and fine) starts from prev segment's last fine output
+    teacher_forcing_ratio = max(0.0, 1.0 - curriculum_ratio)
+
     coarse_losses = []
+    fine_losses = []
+    z_current = all_z[0]
     for k in range(K):
+        # Coarse waypoint for this segment
         seg_actions = torch.stack(
             latent_actions[k * h : (k + 1) * h], dim=1
         )  # (B, h, latent_action_dim)
-        z = model.coarse_predictor(z, seg_actions)
-        z_coarse_preds.append(z)
-        target = all_z_target[(k + 1) * h - 1]
-        coarse_losses.append(F.smooth_l1_loss(z, target))
-    L_coarse = sum(coarse_losses) / len(coarse_losses)
+        z_waypoint = model.coarse_predictor(z_current, seg_actions)
+        coarse_target = all_z_target[(k + 1) * h - 1]
+        coarse_losses.append(F.smooth_l1_loss(z_waypoint, coarse_target))
 
-    # ---- Step 5: Multi-step fine rollout per segment (scheduled sampling) ----
-    teacher_forcing_ratio = max(0.0, 1.0 - curriculum_ratio)
-
-    fine_losses = []
-    for k in range(K):
-        # Coarse condition for segment k: blend predicted vs target
+        # Coarse condition for fine: blend predicted waypoint vs target (curriculum)
         with torch.no_grad():
             coarse_cond = (
-                curriculum_ratio * z_coarse_preds[k].detach()
-                + (1.0 - curriculum_ratio) * all_z_target[(k + 1) * h - 1]
+                curriculum_ratio * z_waypoint.detach()
+                + (1.0 - curriculum_ratio) * coarse_target
             )
 
-        # Segment start: real encoder for k=0, predictor output for k>0
-        # (matches planning where fine rollout chains from coarse waypoints)
-        z_pred = all_z[0] if k == 0 else z_coarse_preds[k - 1]
-
+        # Fine chained rollout in segment, starting from z_current
+        z_t = z_current
         for t in range(h):
             global_t = k * h + t
-            z_pred = model.fine_predictor(
-                z_pred, latent_actions[global_t], coarse_cond
-            )
-            fine_losses.append(F.smooth_l1_loss(z_pred, all_z_target[global_t]))
+            z_t = model.fine_predictor(z_t, latent_actions[global_t], coarse_cond)
+            fine_losses.append(F.smooth_l1_loss(z_t, all_z_target[global_t]))
 
-            # Scheduled sampling: occasionally swap in GT next-step input
+            # Scheduled sampling within segment
             if t < h - 1 and torch.rand(1).item() < teacher_forcing_ratio:
-                z_pred = all_z[global_t + 1]
+                z_t = all_z[global_t + 1]
 
+        # Next segment's coarse AND fine start from this segment's fine output
+        # (matches planning).  No segment-boundary teacher forcing — planning
+        # has no GT to swap in, so we don't either.
+        z_current = z_t
+
+    L_coarse = sum(coarse_losses) / len(coarse_losses)
     L_fine = sum(fine_losses) / len(fine_losses)
 
     # ---- Step 6: Action regularization ----
