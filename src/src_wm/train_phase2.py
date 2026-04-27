@@ -22,9 +22,9 @@ Sequences of length >= K*h+1 are loaded so the chained rollout can run
 end to end and proprio at every timestep is available for supervision.
 
 Usage:
-  cd /Users/guanchendu/Code/StudyOnWM/src
-  conda run -n wm python -m src_wm.train_phase2 \
-    --phase1-ckpt outputs/hierarchical_invdyn/best_phase1.pt \
+  cd /Users/guanchendu/Code/StudyOnWM
+  conda run -n wm python -m src.src_wm.train_phase2 \
+    --phase1-ckpt src/outputs/hierarchical_invdyn/best_phase1.pt \
     --label-fraction 0.1
 """
 
@@ -48,7 +48,7 @@ import torch
 import torch.nn.functional as F
 
 from Background.utils import get_column_normalizer, get_img_preprocessor
-from src_wm.models import (
+from src.src_wm.models import (
     ActionDecoder,
     ActionEncoder,
     HierarchicalInvDynWorldModel,
@@ -353,7 +353,8 @@ def main():
     if not ckpt_path.exists():
         raise FileNotFoundError(
             f"Phase 1 checkpoint not found: {ckpt_path}\n"
-            f"Run train_phase1.py first to produce it."
+            f"Run train_phase1 first (from StudyOnWM/):\n"
+            f"  python -m src.src_wm.train_phase1"
         )
     ckpt = torch.load(ckpt_path, map_location="cpu")
     p1_cfg = ckpt["config"]

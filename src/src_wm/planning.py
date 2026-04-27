@@ -26,7 +26,7 @@ if str(ROOT_DIR) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from src_wm.models import (
+from src.src_wm.models import (
     ActionDecoder,
     ActionEncoder,
     HierarchicalInvDynWorldModel,

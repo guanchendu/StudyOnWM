@@ -16,8 +16,8 @@ Training (multi-step rollout, K coarse segments × h fine steps each):
   6. State variance regularization on z (VICReg-style) to prevent collapse
 
 Usage:
-  cd /Users/guanchendu/Code/StudyOnWM/src
-  conda run -n wm python -m src_wm.train_phase1 --epochs 100
+  cd /Users/guanchendu/Code/StudyOnWM
+  conda run -n wm python -m src.src_wm.train_phase1 --epochs 100
 """
 
 import argparse
@@ -41,7 +41,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from Background.utils import get_column_normalizer, get_img_preprocessor
-from src_wm.models import HierarchicalInvDynWorldModel
+from src.src_wm.models import HierarchicalInvDynWorldModel
 
 DEFAULT_CACHE_DIR = "/Users/guanchendu/Code/StudyOnWM/data"
 

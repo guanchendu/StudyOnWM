@@ -4,10 +4,10 @@ Evaluate the full Hierarchical JEPA + InvDyn framework on TwoRoom.
 Loads Phase 1 + Phase 2 checkpoints and runs CEM-based planning.
 
 Usage:
-  cd /Users/guanchendu/Code/StudyOnWM/src
-  python -m src_wm.evaluate \
-    --phase1-ckpt outputs/hierarchical_invdyn/best_phase1.pt \
-    --phase2-ckpt outputs/hierarchical_invdyn/best_phase2.pt
+  cd /Users/guanchendu/Code/StudyOnWM
+  python -m src.src_wm.evaluate \
+    --phase1-ckpt src/outputs/hierarchical_invdyn/best_phase1.pt \
+    --phase2-ckpt src/outputs/hierarchical_invdyn/best_phase2.pt
 """
 
 import argparse
@@ -35,7 +35,7 @@ import torch
 from stable_worldmodel.solver import CEMSolver
 from torchvision.transforms import v2 as transforms
 
-from src_wm.planning import HierarchicalCostModel
+from src.src_wm.planning import HierarchicalCostModel
 
 
 DEFAULT_CACHE_DIR = "/Users/guanchendu/Code/StudyOnWM/data"
@@ -195,8 +195,8 @@ def main():
         if not Path(ckpt_arg).exists():
             raise FileNotFoundError(
                 f"{label} checkpoint not found: {ckpt_arg}\n"
-                f"Train it first:\n"
-                f"  python -m src_wm.train_{label}"
+                f"Train it first (run from StudyOnWM/):\n"
+                f"  python -m src.src_wm.train_{label}"
                 + ("" if label == "phase1" else f" --phase1-ckpt {args.phase1_ckpt}")
             )
 

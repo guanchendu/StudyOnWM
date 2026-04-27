@@ -141,12 +141,12 @@ Pre-norm Transformer，每层 SelfAttn → CrossAttn → FFN：
 
 ### 4.4 命令
 ```bash
-cd /Users/guanchendu/Code/StudyOnWM/src
-conda run -n wm python -m src_wm.train_phase1 \
+cd /Users/guanchendu/Code/StudyOnWM
+conda run -n wm python -m src.src_wm.train_phase1 \
   --epochs 100 --coarse-segments 2 --num-steps 11
 ```
 
-输出：`outputs/hierarchical_invdyn/best_phase1.pt`
+输出：`src/outputs/hierarchical_invdyn/best_phase1.pt`
 
 ---
 
@@ -207,14 +207,15 @@ L_total    = (L_align + L_decode + 0.5*L_cycle) + λ_proprio * L_proprio
 
 ### 5.3 命令
 ```bash
-conda run -n wm python -m src_wm.train_phase2 \
-  --phase1-ckpt outputs/hierarchical_invdyn/best_phase1.pt \
+cd /Users/guanchendu/Code/StudyOnWM
+conda run -n wm python -m src.src_wm.train_phase2 \
+  --phase1-ckpt src/outputs/hierarchical_invdyn/best_phase1.pt \
   --label-fraction 0.1 --epochs 50
 # 可选：覆盖 K 或调整 real-path 权重
 #   --coarse-segments 2 --lambda-real-path 1.0
 ```
 
-输出：`outputs/hierarchical_invdyn/best_phase2.pt`
+输出：`src/outputs/hierarchical_invdyn/best_phase2.pt`
 
 ### 5.4 关键监控
 - `proprio_idm_fine` / `proprio_real_fine`：两条路径在 fine rollout 输出上的 MSE。**两者都应该收敛到与 `proprio_enc` 同量级**。
@@ -251,13 +252,14 @@ conda run -n wm python -m src_wm.train_phase2 \
 
 ### 6.3 命令
 ```bash
-conda run -n wm python -m src_wm.evaluate \
-  --phase1-ckpt outputs/hierarchical_invdyn/best_phase1.pt \
-  --phase2-ckpt outputs/hierarchical_invdyn/best_phase2.pt \
+cd /Users/guanchendu/Code/StudyOnWM
+conda run -n wm python -m src.src_wm.evaluate \
+  --phase1-ckpt src/outputs/hierarchical_invdyn/best_phase1.pt \
+  --phase2-ckpt src/outputs/hierarchical_invdyn/best_phase2.pt \
   --num-eval 50
 ```
 
-输出：`outputs/hierarchical_invdyn/eval_src_wm.json` + `eval_videos/`
+输出：`src/outputs/hierarchical_invdyn/eval_src_wm.json` + `eval_videos/`
 
 ---
 
