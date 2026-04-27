@@ -1,17 +1,23 @@
 """
-Phase 1: Self-supervised pre-training (no action labels needed).
+Phase 1: Self-supervised pre-training of Hierarchical JEPA + (single) Inverse Dynamics.
 
-Training flow per batch:
-  1. Encode all frames with online encoder → z_0, z_1, ..., z_h
-  2. Encode supervision targets with target encoder → z_1^target, z_h^target
-  3. Compute latent actions via inverse dynamics: â_t = inv(z_t, z_{t+1})
-  4. Coarse prediction: z_0 + [â_0,...,â_{h-1}] → ẑ_h,  supervised by z_h^target
-  5. Fine prediction:   z_0 + â_0 + cond(ẑ_h)  → ẑ_1,  supervised by z_1^target
-  6. Regularize latent actions to prevent collapse
+Architecture:
+  - Single fine inverse dynamics: â_t = inv(z_t, z_{t+1})
+  - Coarse predictor: z_t + [â_0, ..., â_{h-1}] → ẑ_{t+h}    (token output)
+  - Fine predictor:   z_t + â_t + cond(ẑ_{t+h})    → ẑ_{t+1}  (token output)
+
+Training (multi-step rollout, K coarse segments × h fine steps each):
+  1. Encode K*h+1 frames with online encoder
+  2. EMA target encoder produces supervision targets
+  3. Compute fine latent actions via inverse dynamics for all K*h pairs
+  4. Multi-step coarse rollout: K segments, gradients flow through chain
+  5. Multi-step fine rollout per segment with scheduled sampling
+     (matches planning where fine predictions are chained from prior outputs)
+  6. State variance regularization on z (VICReg-style) to prevent collapse
 
 Usage:
   cd /Users/guanchendu/Code/StudyOnWM/src
-  python -m src_wm.train_phase1 --horizon-h 5 --num-steps 8 --epochs 100
+  conda run -n wm python -m src_wm.train_phase1 --epochs 100
 """
 
 import argparse
@@ -31,6 +37,7 @@ if str(SRC_DIR) not in sys.path:
 import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from Background.utils import get_column_normalizer, get_img_preprocessor
@@ -50,8 +57,7 @@ def build_dataset(
     num_steps: int,
     frameskip: int,
 ):
-    """Build tworoom dataset. We load action/proprio for Phase 2 compatibility,
-    but Phase 1 training does NOT use them — latent actions come from inverse dynamics."""
+    """Build tworoom dataset. Phase 1 does not use action labels."""
     keys_to_load = ["pixels", "action", "proprio"]
     keys_to_cache = ["action", "proprio"]
 
@@ -76,6 +82,49 @@ def build_dataset(
 
 
 # ============================================================
+# Regularizers
+# ============================================================
+
+
+def compute_action_reg(
+    actions: torch.Tensor, variance_threshold: float = 0.1
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """L2 + variance reg for latent actions. Prevents trivial collapse."""
+    l2_reg = actions.pow(2).mean()
+    per_dim_var = actions.var(dim=0)
+    var_reg = F.relu(variance_threshold - per_dim_var).mean()
+    return l2_reg, var_reg, per_dim_var
+
+
+def compute_state_reg(
+    z_pooled: torch.Tensor,
+    variance_threshold: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """VICReg-style variance + covariance regularization on STATE latents.
+
+    Prevents the encoder/EMA-target from collapsing to near-constant z
+    (which would let smooth_l1(z_pred, z_target) → 0 trivially).
+
+    Args:
+        z_pooled: (N, D) pooled state vectors aggregated across the batch and time.
+
+    Returns:
+        var_reg, cov_reg, per_dim_std
+    """
+    eps = 1e-4
+    per_dim_std = (z_pooled.var(dim=0) + eps).sqrt()
+    var_reg = F.relu(variance_threshold - per_dim_std).mean()
+
+    z_centered = z_pooled - z_pooled.mean(dim=0, keepdim=True)
+    n, d = z_centered.shape
+    cov = (z_centered.T @ z_centered) / max(1, n - 1)
+    off_diag = cov - torch.diag(torch.diag(cov))
+    cov_reg = off_diag.pow(2).sum() / d
+
+    return var_reg, cov_reg, per_dim_std
+
+
+# ============================================================
 # Loss Computation
 # ============================================================
 
@@ -84,85 +133,122 @@ def compute_phase1_loss(
     model: HierarchicalInvDynWorldModel,
     batch: dict[str, torch.Tensor],
     curriculum_ratio: float = 0.0,
+    coarse_segments: int = 2,
     lambda_coarse: float = 1.0,
-    lambda_reg: float = 0.01,
+    lambda_reg_action: float = 0.01,
+    lambda_state_var: float = 1.0,
+    lambda_state_cov: float = 0.04,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """
-    Compute Phase 1 losses: L_fine + λ_coarse * L_coarse + λ_reg * L_reg.
+    """Phase 1 loss with multi-step rollout at both scales.
 
-    Data format:
-        pixels: (B, T, C, H, W) where T >= horizon_h + 1
+    Pixels (B, T, C, H, W), T >= K*h + 1. No action labels used.
 
-    No action labels are used. Latent actions come from inverse dynamics.
+    Steps:
+      1. Encode all K*h+1 frames (online encoder)
+      2. Encode supervision targets (EMA target encoder, no grad)
+      3. Compute fine latent actions for all K*h pairs via inverse dynamics
+      4. Multi-step coarse rollout (K segments) — gradients flow through chain
+      5. Multi-step fine rollout per segment with scheduled sampling
+      6. Action L2 + variance reg
+      7. State variance + covariance reg (VICReg-style)
     """
     pixels = batch["pixels"].float()
-    B, T = pixels.shape[:2]
     h = model.horizon_h
+    K = coarse_segments
+    total_steps = K * h + 1
 
-    # ---- Step 1: Encode ALL frames with online encoder ----
-    # We need z_0, z_1, ..., z_h for inverse dynamics (all need gradients)
-    all_z = []
-    for t in range(h + 1):
-        all_z.append(model.encode(pixels[:, t]))  # (B, num_tokens, D)
+    # ---- Step 1: Online encoder for all frames ----
+    all_z = [model.encode(pixels[:, t]) for t in range(total_steps)]
 
-    # ---- Step 2: Target encoder for supervision ----
+    # ---- Step 2: Target encoder (no grad). all_z_target[t-1] ↔ pixels[:, t] ----
     with torch.no_grad():
-        z_1_target = model.encode_target(pixels[:, 1]).mean(dim=1)  # (B, D)
-        z_h_target = model.encode_target(pixels[:, h]).mean(dim=1)  # (B, D)
+        all_z_target = [
+            model.encode_target(pixels[:, t]) for t in range(1, total_steps)
+        ]
 
-    # ---- Step 3: Compute latent actions via inverse dynamics ----
+    # ---- Step 3: Fine inverse dynamics for all K*h pairs ----
     latent_actions = []
-    for t in range(h):
-        a_hat = model.compute_latent_action(all_z[t], all_z[t + 1])  # (B, latent_action_dim)
+    for t in range(K * h):
+        a_hat = model.compute_latent_action(all_z[t], all_z[t + 1])
         latent_actions.append(a_hat)
 
-    latent_actions_stacked = torch.stack(latent_actions, dim=1)  # (B, h, latent_action_dim)
+    # ---- Step 4: Multi-step coarse rollout (K segments) ----
+    z_coarse_preds = []
+    z = all_z[0]
+    coarse_losses = []
+    for k in range(K):
+        seg_actions = torch.stack(
+            latent_actions[k * h : (k + 1) * h], dim=1
+        )  # (B, h, latent_action_dim)
+        z = model.coarse_predictor(z, seg_actions)
+        z_coarse_preds.append(z)
+        target = all_z_target[(k + 1) * h - 1]
+        coarse_losses.append(F.smooth_l1_loss(z, target))
+    L_coarse = sum(coarse_losses) / len(coarse_losses)
 
-    # ---- Step 4: Coarse prediction ----
-    z_h_coarse = model.coarse_predictor(
-        all_z[0], latent_actions_stacked
-    )  # (B, D)
+    # ---- Step 5: Multi-step fine rollout per segment (scheduled sampling) ----
+    teacher_forcing_ratio = max(0.0, 1.0 - curriculum_ratio)
 
-    L_coarse = F.smooth_l1_loss(z_h_coarse, z_h_target)
+    fine_losses = []
+    for k in range(K):
+        # Coarse condition for segment k: blend predicted vs target
+        with torch.no_grad():
+            coarse_cond = (
+                curriculum_ratio * z_coarse_preds[k].detach()
+                + (1.0 - curriculum_ratio) * all_z_target[(k + 1) * h - 1]
+            )
 
-    # ---- Step 5: Fine prediction with curriculum conditioning ----
-    with torch.no_grad():
-        coarse_cond = (
-            curriculum_ratio * z_h_coarse.detach()
-            + (1.0 - curriculum_ratio) * z_h_target
-        )
+        # Segment start: real encoder for k=0, predictor output for k>0
+        # (matches planning where fine rollout chains from coarse waypoints)
+        z_pred = all_z[0] if k == 0 else z_coarse_preds[k - 1]
 
-    z_1_fine = model.fine_predictor(
-        all_z[0], latent_actions[0], coarse_cond
-    )  # (B, D)
+        for t in range(h):
+            global_t = k * h + t
+            z_pred = model.fine_predictor(
+                z_pred, latent_actions[global_t], coarse_cond
+            )
+            fine_losses.append(F.smooth_l1_loss(z_pred, all_z_target[global_t]))
 
-    L_fine = F.smooth_l1_loss(z_1_fine, z_1_target)
+            # Scheduled sampling: occasionally swap in GT next-step input
+            if t < h - 1 and torch.rand(1).item() < teacher_forcing_ratio:
+                z_pred = all_z[global_t + 1]
 
-    # ---- Step 6: Latent action regularization (prevent collapse) ----
-    # L2 norm penalty
-    L_reg_l2 = sum(a.pow(2).mean() for a in latent_actions) / len(latent_actions)
+    L_fine = sum(fine_losses) / len(fine_losses)
 
-    # Variance regularization: ensure each dim has variance across the batch
-    all_actions_cat = torch.cat(latent_actions, dim=0)  # (B*h, latent_action_dim)
-    per_dim_var = all_actions_cat.var(dim=0)  # (latent_action_dim,)
-    variance_threshold = 0.1
-    L_reg_var = F.relu(variance_threshold - per_dim_var).mean()
+    # ---- Step 6: Action regularization ----
+    all_actions_cat = torch.cat(latent_actions, dim=0)
+    a_l2, a_var_reg, a_per_dim_var = compute_action_reg(all_actions_cat)
+    L_reg_action = a_l2 + a_var_reg
 
-    L_reg = L_reg_l2 + L_reg_var
+    # ---- Step 7: State regularization (VICReg-style) ----
+    # Aggregate online-encoder z over all frames in the batch.
+    all_z_stack = torch.stack(all_z, dim=1)            # (B, T, N_tok, D)
+    B_, T_, N_tok, D_ = all_z_stack.shape
+    z_pooled_all = all_z_stack.mean(dim=2).reshape(B_ * T_, D_)  # (B*T, D)
+    s_var_reg, s_cov_reg, s_per_dim_std = compute_state_reg(z_pooled_all)
 
-    # ---- Total loss ----
-    L_total = L_fine + lambda_coarse * L_coarse + lambda_reg * L_reg
+    # ---- Total ----
+    L_total = (
+        L_fine
+        + lambda_coarse * L_coarse
+        + lambda_reg_action * L_reg_action
+        + lambda_state_var * s_var_reg
+        + lambda_state_cov * s_cov_reg
+    )
 
     metrics = {
         "fine_loss": L_fine.item(),
         "coarse_loss": L_coarse.item(),
-        "reg_loss": L_reg.item(),
-        "reg_l2": L_reg_l2.item(),
-        "reg_var": L_reg_var.item(),
+        "reg_action": L_reg_action.item(),
+        "state_var_reg": s_var_reg.item(),
+        "state_cov_reg": s_cov_reg.item(),
         "total_loss": L_total.item(),
-        "latent_action_norm": all_actions_cat.norm(dim=-1).mean().item(),
-        "latent_action_var": per_dim_var.mean().item(),
+        "action_norm": all_actions_cat.norm(dim=-1).mean().item(),
+        "action_var": a_per_dim_var.mean().item(),
+        "state_std_mean": s_per_dim_std.mean().item(),
+        "state_std_min": s_per_dim_std.min().item(),
         "curriculum_ratio": curriculum_ratio,
+        "teacher_forcing_ratio": teacher_forcing_ratio,
     }
 
     return L_total, metrics
@@ -180,8 +266,11 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None,
     epoch: int,
     total_epochs: int,
+    coarse_segments: int = 2,
     lambda_coarse: float = 1.0,
-    lambda_reg: float = 0.01,
+    lambda_reg_action: float = 0.01,
+    lambda_state_var: float = 1.0,
+    lambda_state_cov: float = 0.04,
     curriculum_warmup_fraction: float = 0.7,
 ) -> dict[str, float]:
     is_train = optimizer is not None
@@ -199,13 +288,18 @@ def run_epoch(
 
         with torch.set_grad_enabled(is_train):
             loss, metrics = compute_phase1_loss(
-                model, batch, curriculum_ratio, lambda_coarse, lambda_reg
+                model, batch, curriculum_ratio,
+                coarse_segments,
+                lambda_coarse,
+                lambda_reg_action,
+                lambda_state_var,
+                lambda_state_cov,
             )
 
         if is_train:
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             model.update_target_encoder()
 
@@ -224,12 +318,15 @@ def run_epoch(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Phase 1: Self-supervised pre-training of Hierarchical JEPA + InvDyn"
+        description="Phase 1: Hierarchical JEPA + (single) Inverse Dynamics"
     )
     parser.add_argument("--cache-dir", type=str, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--img-size", type=int, default=64)
     parser.add_argument("--horizon-h", type=int, default=5)
-    parser.add_argument("--num-steps", type=int, default=8)
+    parser.add_argument("--coarse-segments", type=int, default=2,
+                        help="Chained coarse predictions during training (K_train)")
+    parser.add_argument("--num-steps", type=int, default=11,
+                        help="Frames per sample, must be >= coarse_segments * horizon_h + 1")
     parser.add_argument("--frameskip", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=100)
@@ -241,7 +338,9 @@ def parse_args():
     parser.add_argument("--num-fine-layers", type=int, default=3)
     parser.add_argument("--dim-ff", type=int, default=512)
     parser.add_argument("--lambda-coarse", type=float, default=1.0)
-    parser.add_argument("--lambda-reg", type=float, default=0.01)
+    parser.add_argument("--lambda-reg-action", type=float, default=0.01)
+    parser.add_argument("--lambda-state-var", type=float, default=1.0)
+    parser.add_argument("--lambda-state-cov", type=float, default=0.04)
     parser.add_argument("--ema-momentum", type=float, default=0.996)
     parser.add_argument("--curriculum-warmup", type=float, default=0.7)
     parser.add_argument("--train-split", type=float, default=0.9)
@@ -261,42 +360,30 @@ def main():
     else:
         device = torch.device("cpu")
 
-    assert args.num_steps > args.horizon_h, (
-        f"num_steps ({args.num_steps}) must be > horizon_h ({args.horizon_h})"
+    assert args.num_steps >= args.coarse_segments * args.horizon_h + 1, (
+        f"num_steps ({args.num_steps}) must be >= "
+        f"coarse_segments * horizon_h + 1 "
+        f"({args.coarse_segments * args.horizon_h + 1})"
     )
 
-    # ---- Dataset ----
     dataset = build_dataset(
-        cache_dir=args.cache_dir,
-        img_size=args.img_size,
-        num_steps=args.num_steps,
-        frameskip=args.frameskip,
+        args.cache_dir, args.img_size, args.num_steps, args.frameskip,
     )
 
     rnd_gen = torch.Generator().manual_seed(args.seed)
     train_set, val_set = spt.data.random_split(
-        dataset,
-        lengths=[args.train_split, 1 - args.train_split],
-        generator=rnd_gen,
+        dataset, [args.train_split, 1 - args.train_split], generator=rnd_gen,
     )
 
     train_loader = torch.utils.data.DataLoader(
-        train_set,
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
-        num_workers=args.num_workers,
-        generator=rnd_gen,
+        train_set, batch_size=args.batch_size, shuffle=True,
+        drop_last=True, num_workers=args.num_workers, generator=rnd_gen,
     )
     val_loader = torch.utils.data.DataLoader(
-        val_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        drop_last=False,
-        num_workers=args.num_workers,
+        val_set, batch_size=args.batch_size, shuffle=False,
+        drop_last=False, num_workers=args.num_workers,
     )
 
-    # ---- Model ----
     model = HierarchicalInvDynWorldModel(
         latent_dim=args.latent_dim,
         latent_action_dim=args.latent_action_dim,
@@ -311,27 +398,23 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    num_params = sum(p.numel() for p in model.parameters())
-    num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    num_p = sum(p.numel() for p in model.parameters())
+    num_t = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     print("=" * 72)
-    print("Phase 1: Self-Supervised Pre-training")
-    print("Hierarchical JEPA + Inverse Dynamics")
+    print("Phase 1: Hierarchical JEPA + (single) Inverse Dynamics")
     print("=" * 72)
     print(f"device             : {device}")
-    print(f"dataset size       : {len(dataset)}")
-    print(f"train / val        : {len(train_set)} / {len(val_set)}")
-    print(f"sequence length    : {args.num_steps} (frameskip={args.frameskip})")
-    print(f"coarse horizon (h) : {args.horizon_h}")
+    print(f"dataset            : {len(dataset)} (train {len(train_set)} / val {len(val_set)})")
+    print(f"sequence           : {args.num_steps} steps (frameskip={args.frameskip})")
+    print(f"horizon (h)        : {args.horizon_h}")
+    print(f"coarse segments K  : {args.coarse_segments}")
     print(f"latent dim         : {args.latent_dim}")
     print(f"latent action dim  : {args.latent_action_dim}")
     print(f"num tokens         : {args.num_tokens}")
-    print(f"fine layers        : {args.num_fine_layers}")
-    print(f"total params       : {num_params:,}")
-    print(f"trainable params   : {num_trainable:,}")
+    print(f"params             : {num_p:,} total, {num_t:,} trainable")
     print("=" * 72)
 
-    # ---- Training ----
     output_dir = Path("outputs") / "hierarchical_invdyn"
     output_dir.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
@@ -339,27 +422,29 @@ def main():
     for epoch in range(1, args.epochs + 1):
         train_m = run_epoch(
             model, train_loader, device, optimizer,
-            epoch, args.epochs, args.lambda_coarse, args.lambda_reg,
+            epoch, args.epochs,
+            args.coarse_segments,
+            args.lambda_coarse, args.lambda_reg_action,
+            args.lambda_state_var, args.lambda_state_cov,
             args.curriculum_warmup,
         )
-
         val_m = run_epoch(
             model, val_loader, device, None,
-            epoch, args.epochs, args.lambda_coarse, args.lambda_reg,
+            epoch, args.epochs,
+            args.coarse_segments,
+            args.lambda_coarse, args.lambda_reg_action,
+            args.lambda_state_var, args.lambda_state_cov,
             args.curriculum_warmup,
         )
-
         scheduler.step()
 
         print(
-            f"[Epoch {epoch:03d}] "
-            f"train: fine={train_m['fine_loss']:.4f} "
-            f"coarse={train_m['coarse_loss']:.4f} "
-            f"reg={train_m['reg_loss']:.4f} "
-            f"act_var={train_m['latent_action_var']:.4f} | "
-            f"val: fine={val_m['fine_loss']:.4f} "
-            f"coarse={val_m['coarse_loss']:.4f} | "
-            f"cur={train_m['curriculum_ratio']:.2f}"
+            f"[{epoch:03d}] "
+            f"train: fine={train_m['fine_loss']:.4f} coarse={train_m['coarse_loss']:.4f} "
+            f"avar={train_m['action_var']:.3f} sstd={train_m['state_std_mean']:.3f}"
+            f"({train_m['state_std_min']:.3f}) | "
+            f"val: fine={val_m['fine_loss']:.4f} coarse={val_m['coarse_loss']:.4f} | "
+            f"cur={train_m['curriculum_ratio']:.2f} tf={train_m['teacher_forcing_ratio']:.2f}"
         )
 
         if val_m["total_loss"] < best_val:
@@ -374,8 +459,7 @@ def main():
                 output_dir / "best_phase1.pt",
             )
 
-    print(f"\nBest val loss: {best_val:.4f}")
-    print(f"Checkpoint: {output_dir / 'best_phase1.pt'}")
+    print(f"\nBest val: {best_val:.4f} → {output_dir / 'best_phase1.pt'}")
 
 
 if __name__ == "__main__":

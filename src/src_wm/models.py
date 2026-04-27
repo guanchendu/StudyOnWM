@@ -1,23 +1,23 @@
 """
 All model components for Hierarchical JEPA + Inverse Dynamics framework.
 
-Modules:
-  1. TokenEncoder           — image → latent tokens
+Architecture (single-scale fine inverse dynamics + hierarchical predictors):
+  1. TokenEncoder           — image → latent token sequence (B, num_tokens, D)
   2. EMATargetEncoder       — EMA copy for supervision targets
-  3. InverseDynamicsModel   — (z_t, z_{t+1}) → â_t (latent action)
-  4. CoarsePredictor        — z_t + â_{0:h} → ẑ_{t+h}
+  3. InverseDynamicsModel   — (z_t, z_{t+1}) → â_t   (single FINE inverse dynamics)
+  4. CoarsePredictor        — z_t + [â_0, ..., â_{h-1}] → ẑ_{t+h}   (token output)
   5. FineTransformerBlock   — self-attention + cross-attention block
-  6. FinePredictor          — z_t + â_t + cond(ẑ_{t+h}) → ẑ_{t+1}
+  6. FinePredictor          — z_t + â_t + cond(ẑ_{t+h}) → ẑ_{t+1}   (token output)
   7. ActionEncoder          — real action → latent action (Phase 2)
   8. ActionDecoder          — latent action → real action (Phase 2)
-  9. HierarchicalInvDynWorldModel — combines 1-6 into Phase 1 model
+  9. ProprioDecoder         — latent state → proprio   (Phase 2; used by planner cost)
+  10. HierarchicalInvDynWorldModel — combines 1-6 into Phase 1 model
 """
 
 import copy
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 # ============================================================
@@ -79,7 +79,7 @@ class EMATargetEncoder(nn.Module):
 
 
 # ============================================================
-# 3. Inverse Dynamics Model
+# 3. Inverse Dynamics Model — single scale, fine grained
 # ============================================================
 
 
@@ -88,8 +88,8 @@ class InverseDynamicsModel(nn.Module):
 
     (z_t, z_{t+1}) → â_t
 
-    Uses information bottleneck: latent_action_dim << latent_dim
-    to prevent encoding all of z_{t+1} into â_t.
+    Bottleneck: latent_action_dim << latent_dim
+    prevents encoding all of z_{t+1} into â_t.
     """
 
     def __init__(
@@ -108,26 +108,24 @@ class InverseDynamicsModel(nn.Module):
             nn.Linear(hidden_dim, latent_action_dim),
         )
 
-    def forward(
-        self, z_t: torch.Tensor, z_tp1: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        z_t:   (B, D) — pooled latent of current frame
-        z_tp1: (B, D) — pooled latent of next frame
-        Returns: â_t (B, latent_action_dim)
-        """
+    def forward(self, z_t: torch.Tensor, z_tp1: torch.Tensor) -> torch.Tensor:
+        """z_t, z_tp1: (B, D). Returns â_t (B, latent_action_dim)."""
         return self.net(torch.cat([z_t, z_tp1], dim=-1))
 
 
 # ============================================================
-# 4. Coarse Predictor
+# 4. Coarse Predictor — outputs full token sequence
 # ============================================================
 
 
 class CoarsePredictor(nn.Module):
-    """Predict z_{t+h} from z_t + latent actions over h steps.
+    """Predict z_{t+h} from z_t + h concatenated fine latent actions.
 
     z_t + [â_0, ..., â_{h-1}] → ẑ_{t+h}
+
+    Output keeps the token structure (B, num_tokens, D) so that the
+    fine predictor can attend over distinct tokens during rollout
+    (not collapsed to a single repeated vector).
     """
 
     def __init__(
@@ -135,8 +133,11 @@ class CoarsePredictor(nn.Module):
         latent_dim: int,
         latent_action_dim: int,
         horizon_h: int,
+        num_tokens: int,
     ):
         super().__init__()
+        self.num_tokens = num_tokens
+        self.latent_dim = latent_dim
         input_dim = latent_dim + horizon_h * latent_action_dim
         hidden_dim = latent_dim * 2
         self.net = nn.Sequential(
@@ -144,9 +145,9 @@ class CoarsePredictor(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
+            nn.Linear(hidden_dim, num_tokens * latent_dim),
         )
+        self.norm = nn.LayerNorm(latent_dim)
 
     def forward(
         self,
@@ -154,17 +155,18 @@ class CoarsePredictor(nn.Module):
         latent_actions: torch.Tensor,
     ) -> torch.Tensor:
         """
-        z_t:            (B, num_tokens, D) — current latent tokens
-        latent_actions: (B, h, latent_action_dim) — latent actions for h steps
-        Returns:        (B, D)
+        z_t:            (B, num_tokens, D)
+        latent_actions: (B, h, latent_action_dim)
+        Returns:        (B, num_tokens, D)
         """
         z_pooled = z_t.mean(dim=1)
         a_flat = latent_actions.flatten(1)
-        return self.net(torch.cat([z_pooled, a_flat], dim=-1))
+        h = self.net(torch.cat([z_pooled, a_flat], dim=-1))
+        return self.norm(h.view(-1, self.num_tokens, self.latent_dim))
 
 
 # ============================================================
-# 5. Fine Predictor — Self-Attention + Cross-Attention
+# 5. Fine Predictor — Self-Attention + Cross-Attention, token output
 # ============================================================
 
 
@@ -198,13 +200,7 @@ class FineTransformerBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(
-        self, x: torch.Tensor, coarse_kv: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        x:         (B, N, D) — fine-grained tokens
-        coarse_kv: (B, M, D) — coarse condition for cross-attention K/V
-        """
+    def forward(self, x: torch.Tensor, coarse_kv: torch.Tensor) -> torch.Tensor:
         h = self.norm_sa(x)
         x = x + self.self_attn(h, h, h)[0]
 
@@ -218,9 +214,13 @@ class FineTransformerBlock(nn.Module):
 
 
 class FinePredictor(nn.Module):
-    """Predict z_{t+1} from z_t + latent action, conditioned on coarse waypoint.
+    """Predict z_{t+1} from z_t + latent action, conditioned on coarse waypoint ẑ_{t+h}.
 
     Input tokens: [z_t tokens, action_token] → Self-Attn + Cross-Attn → ẑ_{t+1}
+
+    Outputs full token sequence (B, num_tokens, D) so multi-step rollout
+    keeps a real per-token representation rather than a duplicated vector.
+    coarse_cond can be tokens (B, num_tokens, D) or pooled (B, D).
     """
 
     def __init__(
@@ -264,18 +264,21 @@ class FinePredictor(nn.Module):
         """
         z_t:           (B, num_tokens, D)
         latent_action: (B, latent_action_dim)
-        coarse_cond:   (B, D)
-        Returns:       (B, D)
+        coarse_cond:   (B, num_tokens, D) or (B, D)
+        Returns:       (B, num_tokens, D)
         """
+        N = z_t.shape[1]
         a_token = self.action_proj(latent_action)
         x = torch.cat([z_t, a_token.unsqueeze(1)], dim=1)
 
-        coarse_kv = self.coarse_proj(coarse_cond).unsqueeze(1)
+        coarse_kv = self.coarse_proj(coarse_cond)
+        if coarse_kv.dim() == 2:
+            coarse_kv = coarse_kv.unsqueeze(1)
 
         for block in self.blocks:
             x = block(x, coarse_kv)
 
-        x = x.mean(dim=1)
+        x = x[:, :N, :]
         return self.output_proj(self.output_norm(x))
 
 
@@ -319,19 +322,53 @@ class ActionDecoder(nn.Module):
 
 
 # ============================================================
-# 7. Full Phase 1 Model
+# 7. Proprio Decoder (Phase 2) — used by planner cost
+# ============================================================
+
+
+class ProprioDecoder(nn.Module):
+    """Decode latent state to proprioception space: z → proprio.
+
+    Trained in Phase 2 with labeled data on BOTH encoder outputs and
+    predictor outputs, so that planning cost computed on rolled-out
+    latent states is in distribution.
+    """
+
+    def __init__(self, latent_dim: int, proprio_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.proprio_dim = proprio_dim
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, proprio_dim),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """z: (B, num_tokens, D) or (B, D). Returns (B, proprio_dim)."""
+        if z.dim() == 3:
+            z = z.mean(dim=1)
+        return self.net(z)
+
+
+# ============================================================
+# 8. Full Phase 1 Model
 # ============================================================
 
 
 class HierarchicalInvDynWorldModel(nn.Module):
-    """Complete Phase 1 model: Encoder + Inverse Dynamics + Coarse/Fine Predictors.
+    """Complete Phase 1 model: Encoder + (single) Inverse Dynamics + Coarse/Fine Predictors.
 
-    Training flow:
-      1. Encode all frames with online encoder
-      2. Compute latent actions via inverse dynamics: â_t = inv(z_t, z_{t+1})
-      3. Coarse prediction: z_0 + [â_0,...,â_{h-1}] → ẑ_h
-      4. Fine prediction:   z_0 + â_0 + cond(ẑ_h)  → ẑ_1
-      5. Supervise with target encoder outputs
+    Training flow (multi-step rollout, K coarse segments × h fine steps):
+      1. Encode K*h+1 frames with online encoder
+      2. EMA target encoder produces supervision targets
+      3. Compute fine latent actions via inverse dynamics: â_t = inv(z_t, z_{t+1})
+      4. Coarse rollout (K segments): z_0 → ẑ_h → ẑ_{2h} → ... → ẑ_{Kh}
+         (each step: coarse_predictor consumes h concatenated fine actions)
+      5. Fine rollout (per segment, with scheduled sampling):
+         z_seg_start + â_t + cond(ẑ_{(k+1)h}) → ẑ_{t+1}
+      6. State variance regularization (VICReg-style) on z, prevents collapse
     """
 
     def __init__(
@@ -359,7 +396,7 @@ class HierarchicalInvDynWorldModel(nn.Module):
         )
 
         self.coarse_predictor = CoarsePredictor(
-            latent_dim, latent_action_dim, horizon_h
+            latent_dim, latent_action_dim, horizon_h, num_tokens
         )
 
         self.fine_predictor = FinePredictor(
@@ -379,11 +416,13 @@ class HierarchicalInvDynWorldModel(nn.Module):
         """Target encoder (no grad): (B, 3, H, W) → (B, num_tokens, D)"""
         return self.target_encoder(pixels)
 
+    def pool(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Pool token sequence to single vector: (B, N, D) → (B, D)."""
+        return tokens.mean(dim=1) if tokens.dim() == 3 else tokens
+
     def compute_latent_action(
         self, z_t: torch.Tensor, z_tp1: torch.Tensor
     ) -> torch.Tensor:
         """Inverse dynamics: (z_t, z_{t+1}) → â_t.
-        Inputs are token sequences, will be pooled internally."""
-        z_t_pooled = z_t.mean(dim=1) if z_t.dim() == 3 else z_t
-        z_tp1_pooled = z_tp1.mean(dim=1) if z_tp1.dim() == 3 else z_tp1
-        return self.inverse_dynamics(z_t_pooled, z_tp1_pooled)
+        Inputs are token sequences; pooled internally."""
+        return self.inverse_dynamics(self.pool(z_t), self.pool(z_tp1))

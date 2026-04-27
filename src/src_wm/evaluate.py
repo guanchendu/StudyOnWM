@@ -290,7 +290,7 @@ def main():
     output_json = (
         Path(args.output_json).expanduser().resolve()
         if args.output_json
-        else Path(args.phase1_ckpt).parent / "eval_hierarchical_invdyn.json"
+        else Path(args.phase1_ckpt).parent / "eval_src_wm.json"
     )
     output_json.parent.mkdir(parents=True, exist_ok=True)
     output_json.write_text(json.dumps(results, indent=2, ensure_ascii=False) + "\n")
